@@ -54,6 +54,7 @@
 #include "template.h"
 #include "http2.h"
 #include "network.h"
+#include "allocator.h"
 
 using namespace nghttp2;
 
@@ -275,10 +276,56 @@ constexpr auto SHRPX_OPT_BACKEND_TLS = StringRef::from_lit("backend-tls");
 constexpr auto SHRPX_OPT_BACKEND_CONNECTIONS_PER_HOST =
     StringRef::from_lit("backend-connections-per-host");
 constexpr auto SHRPX_OPT_ERROR_PAGE = StringRef::from_lit("error-page");
+constexpr auto SHRPX_OPT_NO_KQUEUE = StringRef::from_lit("no-kqueue");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_SETTINGS_TIMEOUT =
+    StringRef::from_lit("frontend-http2-settings-timeout");
+constexpr auto SHRPX_OPT_BACKEND_HTTP2_SETTINGS_TIMEOUT =
+    StringRef::from_lit("backend-http2-settings-timeout");
+constexpr auto SHRPX_OPT_API_MAX_REQUEST_BODY =
+    StringRef::from_lit("api-max-request-body");
+constexpr auto SHRPX_OPT_BACKEND_MAX_BACKOFF =
+    StringRef::from_lit("backend-max-backoff");
+constexpr auto SHRPX_OPT_SERVER_NAME = StringRef::from_lit("server-name");
+constexpr auto SHRPX_OPT_NO_SERVER_REWRITE =
+    StringRef::from_lit("no-server-rewrite");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_OPTIMIZE_WRITE_BUFFER_SIZE =
+    StringRef::from_lit("frontend-http2-optimize-write-buffer-size");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_OPTIMIZE_WINDOW_SIZE =
+    StringRef::from_lit("frontend-http2-optimize-window-size");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_WINDOW_SIZE =
+    StringRef::from_lit("frontend-http2-window-size");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_CONNECTION_WINDOW_SIZE =
+    StringRef::from_lit("frontend-http2-connection-window-size");
+constexpr auto SHRPX_OPT_BACKEND_HTTP2_WINDOW_SIZE =
+    StringRef::from_lit("backend-http2-window-size");
+constexpr auto SHRPX_OPT_BACKEND_HTTP2_CONNECTION_WINDOW_SIZE =
+    StringRef::from_lit("backend-http2-connection-window-size");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE =
+    StringRef::from_lit("frontend-http2-encoder-dynamic-table-size");
+constexpr auto SHRPX_OPT_FRONTEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE =
+    StringRef::from_lit("frontend-http2-decoder-dynamic-table-size");
+constexpr auto SHRPX_OPT_BACKEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE =
+    StringRef::from_lit("backend-http2-encoder-dynamic-table-size");
+constexpr auto SHRPX_OPT_BACKEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE =
+    StringRef::from_lit("backend-http2-decoder-dynamic-table-size");
+constexpr auto SHRPX_OPT_ECDH_CURVES = StringRef::from_lit("ecdh-curves");
+constexpr auto SHRPX_OPT_TLS_SCT_DIR = StringRef::from_lit("tls-sct-dir");
+constexpr auto SHRPX_OPT_BACKEND_CONNECT_TIMEOUT =
+    StringRef::from_lit("backend-connect-timeout");
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
+constexpr char DEFAULT_DOWNSTREAM_HOST[] = "127.0.0.1";
+constexpr int16_t DEFAULT_DOWNSTREAM_PORT = 80;
+
 enum shrpx_proto { PROTO_NONE, PROTO_HTTP1, PROTO_HTTP2, PROTO_MEMCACHED };
+
+enum shrpx_session_affinity {
+  // No session affinity
+  AFFINITY_NONE,
+  // Client IP affinity
+  AFFINITY_IP,
+};
 
 enum shrpx_forwarded_param {
   FORWARDED_NONE = 0,
@@ -294,24 +341,36 @@ enum shrpx_forwarded_node_type {
 };
 
 struct AltSvc {
-  std::string protocol_id, host, origin, service;
+  StringRef protocol_id, host, origin, service;
 
   uint16_t port;
 };
 
+enum UpstreamAltMode {
+  // No alternative mode
+  ALTMODE_NONE,
+  // API processing mode
+  ALTMODE_API,
+  // Health monitor mode
+  ALTMODE_HEALTHMON,
+};
+
 struct UpstreamAddr {
   // The frontend address (e.g., FQDN, hostname, IP address).  If
-  // |host_unix| is true, this is UNIX domain socket path.
-  ImmutableString host;
+  // |host_unix| is true, this is UNIX domain socket path.  This must
+  // be NULL terminated string.
+  StringRef host;
   // For TCP socket, this is <IP address>:<PORT>.  For IPv6 address,
   // address is surrounded by square brackets.  If socket is UNIX
   // domain socket, this is "localhost".
-  ImmutableString hostport;
+  StringRef hostport;
   // frontend port.  0 if |host_unix| is true.
   uint16_t port;
   // For TCP socket, this is either AF_INET or AF_INET6.  For UNIX
   // domain socket, this is 0.
   int family;
+  // Alternate mode
+  int alt_mode;
   // true if |host| contains UNIX domain socket path.
   bool host_unix;
   // true if TLS is enabled.
@@ -319,41 +378,47 @@ struct UpstreamAddr {
   int fd;
 };
 
-struct TLSSessionCache {
-  // ASN1 representation of SSL_SESSION object.  See
-  // i2d_SSL_SESSION(3SSL).
-  std::vector<uint8_t> session_data;
-  // The last time stamp when this cache entry is created or updated.
-  ev_tstamp last_updated;
-};
-
 struct DownstreamAddrConfig {
   Address addr;
   // backend address.  If |host_unix| is true, this is UNIX domain
-  // socket path.
-  ImmutableString host;
+  // socket path.  This must be NULL terminated string.
+  StringRef host;
   // <HOST>:<PORT>.  This does not treat 80 and 443 specially.  If
   // |host_unix| is true, this is "localhost".
-  ImmutableString hostport;
+  StringRef hostport;
+  // hostname sent as SNI field
+  StringRef sni;
   size_t fall;
   size_t rise;
+  // Application protocol used in this group
+  shrpx_proto proto;
   // backend port.  0 if |host_unix| is true.
   uint16_t port;
   // true if |host| contains UNIX domain socket path.
   bool host_unix;
+  bool tls;
+};
+
+// Mapping hash to idx which is an index into
+// DownstreamAddrGroupConfig::addrs.
+struct AffinityHash {
+  AffinityHash(size_t idx, uint32_t hash) : idx(idx), hash(hash) {}
+
+  size_t idx;
+  uint32_t hash;
 };
 
 struct DownstreamAddrGroupConfig {
   DownstreamAddrGroupConfig(const StringRef &pattern)
-      : pattern(pattern.c_str(), pattern.size()),
-        proto(PROTO_HTTP1),
-        tls(false) {}
+      : pattern(pattern), affinity(AFFINITY_NONE) {}
 
-  ImmutableString pattern;
+  StringRef pattern;
   std::vector<DownstreamAddrConfig> addrs;
-  // Application protocol used in this group
-  shrpx_proto proto;
-  bool tls;
+  // Bunch of session affinity hash.  Only used if affinity ==
+  // AFFINITY_IP.
+  std::vector<AffinityHash> affinity_hash;
+  // Session affinity
+  shrpx_session_affinity affinity;
 };
 
 struct TicketKey {
@@ -375,12 +440,24 @@ struct TicketKeys {
   std::vector<TicketKey> keys;
 };
 
+struct TLSCertificate {
+  TLSCertificate(StringRef private_key_file, StringRef cert_file,
+                 std::vector<uint8_t> sct_data)
+      : private_key_file(std::move(private_key_file)),
+        cert_file(std::move(cert_file)),
+        sct_data(std::move(sct_data)) {}
+
+  StringRef private_key_file;
+  StringRef cert_file;
+  std::vector<uint8_t> sct_data;
+};
+
 struct HttpProxy {
   Address addr;
   // host in http proxy URI
-  std::string host;
+  StringRef host;
   // userinfo in http proxy URI, not percent-encoded form
-  std::string userinfo;
+  StringRef userinfo;
   // port in http proxy URI
   uint16_t port;
 };
@@ -393,10 +470,10 @@ struct TLSConfig {
       uint16_t port;
       // Hostname of memcached server.  This is also used as SNI field
       // if TLS is enabled.
-      ImmutableString host;
+      StringRef host;
       // Client private key and certificate for authentication
-      ImmutableString private_key_file;
-      ImmutableString cert_file;
+      StringRef private_key_file;
+      StringRef cert_file;
       ev_tstamp interval;
       // Maximum number of retries when getting TLS ticket key from
       // mamcached, due to network error.
@@ -409,7 +486,7 @@ struct TLSConfig {
       int family;
       bool tls;
     } memcached;
-    std::vector<std::string> files;
+    std::vector<StringRef> files;
     const EVP_CIPHER *cipher;
     // true if --tls-ticket-key-cipher is used
     bool cipher_given;
@@ -422,10 +499,10 @@ struct TLSConfig {
       uint16_t port;
       // Hostname of memcached server.  This is also used as SNI field
       // if TLS is enabled.
-      ImmutableString host;
+      StringRef host;
       // Client private key and certificate for authentication
-      ImmutableString private_key_file;
-      ImmutableString cert_file;
+      StringRef private_key_file;
+      StringRef cert_file;
       // Address family of memcached connection.  One of either
       // AF_INET, AF_INET6 or AF_UNSPEC.
       int family;
@@ -442,7 +519,7 @@ struct TLSConfig {
   // OCSP realted configurations
   struct {
     ev_tstamp update_interval;
-    ImmutableString fetch_ocsp_response_file;
+    StringRef fetch_ocsp_response_file;
     bool disabled;
   } ocsp;
 
@@ -450,35 +527,38 @@ struct TLSConfig {
   struct {
     // Path to file containing CA certificate solely used for client
     // certificate validation
-    ImmutableString cacert;
+    StringRef cacert;
     bool enabled;
   } client_verify;
 
   // Client private key and certificate used in backend connections.
   struct {
-    ImmutableString private_key_file;
-    ImmutableString cert_file;
+    StringRef private_key_file;
+    StringRef cert_file;
   } client;
 
-  // The list of (private key file, certificate file) pair
-  std::vector<std::pair<std::string, std::string>> subcerts;
+  // The list of additional TLS certificate pair
+  std::vector<TLSCertificate> subcerts;
   std::vector<unsigned char> alpn_prefs;
   // list of supported NPN/ALPN protocol strings in the order of
   // preference.
-  std::vector<std::string> npn_list;
+  std::vector<StringRef> npn_list;
   // list of supported SSL/TLS protocol strings.
-  std::vector<std::string> tls_proto_list;
+  std::vector<StringRef> tls_proto_list;
+  std::vector<uint8_t> sct_data;
+  BIO_METHOD *bio_method;
   // Bit mask to disable SSL/TLS protocol versions.  This will be
   // passed to SSL_CTX_set_options().
   long int tls_proto_mask;
-  std::string backend_sni_name;
+  StringRef backend_sni_name;
   std::chrono::seconds session_timeout;
-  ImmutableString private_key_file;
-  ImmutableString private_key_passwd;
-  ImmutableString cert_file;
-  ImmutableString dh_param_file;
-  ImmutableString ciphers;
-  ImmutableString cacert;
+  StringRef private_key_file;
+  StringRef private_key_passwd;
+  StringRef cert_file;
+  StringRef dh_param_file;
+  StringRef ciphers;
+  StringRef ecdh_curves;
+  StringRef cacert;
   bool insecure;
   bool no_http2_cipher_black_list;
 };
@@ -496,7 +576,7 @@ struct HttpConfig {
     // obfuscated value used in "by" parameter of Forwarded header
     // field.  This is only used when user defined static obfuscated
     // string is provided.
-    std::string by_obfuscated;
+    StringRef by_obfuscated;
     // bitwise-OR of one or more of shrpx_forwarded_param values.
     uint32_t params;
     // type of value recorded in "by" parameter of Forwarded header
@@ -513,8 +593,8 @@ struct HttpConfig {
   } xff;
   std::vector<AltSvc> altsvcs;
   std::vector<ErrorPage> error_pages;
-  Headers add_request_headers;
-  Headers add_response_headers;
+  HeaderRefs add_request_headers;
+  HeaderRefs add_response_headers;
   StringRef server_name;
   size_t request_header_field_buffer;
   size_t max_request_header_fields;
@@ -523,30 +603,44 @@ struct HttpConfig {
   bool no_via;
   bool no_location_rewrite;
   bool no_host_rewrite;
+  bool no_server_rewrite;
 };
 
 struct Http2Config {
   struct {
     struct {
       struct {
-        ImmutableString request_header_file;
-        ImmutableString response_header_file;
+        StringRef request_header_file;
+        StringRef response_header_file;
         FILE *request_header;
         FILE *response_header;
       } dump;
       bool frame_debug;
     } debug;
+    struct {
+      ev_tstamp settings;
+    } timeout;
     nghttp2_option *option;
+    nghttp2_option *alt_mode_option;
     nghttp2_session_callbacks *callbacks;
-    size_t window_bits;
-    size_t connection_window_bits;
     size_t max_concurrent_streams;
+    size_t encoder_dynamic_table_size;
+    size_t decoder_dynamic_table_size;
+    int32_t window_size;
+    int32_t connection_window_size;
+    bool optimize_write_buffer_size;
+    bool optimize_window_size;
   } upstream;
   struct {
+    struct {
+      ev_tstamp settings;
+    } timeout;
     nghttp2_option *option;
     nghttp2_session_callbacks *callbacks;
-    size_t window_bits;
-    size_t connection_window_bits;
+    size_t encoder_dynamic_table_size;
+    size_t decoder_dynamic_table_size;
+    int32_t window_size;
+    int32_t connection_window_size;
     size_t max_concurrent_streams;
   } downstream;
   struct {
@@ -560,12 +654,12 @@ struct Http2Config {
 struct LoggingConfig {
   struct {
     std::vector<LogFragment> format;
-    ImmutableString file;
+    StringRef file;
     // Send accesslog to syslog, ignoring accesslog_file.
     bool syslog;
   } access;
   struct {
-    ImmutableString file;
+    StringRef file;
     // Send errorlog to syslog, ignoring errorlog_file.
     bool syslog;
   } error;
@@ -575,6 +669,75 @@ struct LoggingConfig {
 struct RateLimitConfig {
   size_t rate;
   size_t burst;
+};
+
+// Wildcard host pattern routing.  We strips left most '*' from host
+// field.  router includes all path patterns sharing the same wildcard
+// host.
+struct WildcardPattern {
+  WildcardPattern(const StringRef &host) : host(host) {}
+
+  // This might not be NULL terminated.  Currently it is only used for
+  // comparison.
+  StringRef host;
+  Router router;
+};
+
+// Configuration to select backend to forward request
+struct RouterConfig {
+  Router router;
+  // Router for reversed wildcard hosts.  Since this router has
+  // wildcard hosts reversed without '*', one should call match()
+  // function with reversed host stripping last character.  This is
+  // because we require at least one character must match for '*'.
+  // The index stored in this router is index of wildcard_patterns.
+  Router rev_wildcard_router;
+  std::vector<WildcardPattern> wildcard_patterns;
+};
+
+struct DownstreamConfig {
+  DownstreamConfig()
+      : balloc(1024, 1024),
+        timeout{},
+        addr_group_catch_all{0},
+        connections_per_host{0},
+        connections_per_frontend{0},
+        request_buffer_size{0},
+        response_buffer_size{0},
+        family{0} {}
+
+  DownstreamConfig(const DownstreamConfig &) = delete;
+  DownstreamConfig(DownstreamConfig &&) = delete;
+  DownstreamConfig &operator=(const DownstreamConfig &) = delete;
+  DownstreamConfig &operator=(DownstreamConfig &&) = delete;
+
+  // Allocator to allocate memory for Downstream configuration.  Since
+  // we may swap around DownstreamConfig in arbitrary times with API
+  // calls, we should use their own allocator instead of per Config
+  // allocator.
+  BlockAllocator balloc;
+  struct {
+    ev_tstamp read;
+    ev_tstamp write;
+    ev_tstamp idle_read;
+    ev_tstamp connect;
+    // The maximum backoff while checking health check for offline
+    // backend or while detaching failed backend from load balancing
+    // group temporarily.
+    ev_tstamp max_backoff;
+  } timeout;
+  RouterConfig router;
+  std::vector<DownstreamAddrGroupConfig> addr_groups;
+  // The index of catch-all group in downstream_addr_groups.
+  size_t addr_group_catch_all;
+  size_t connections_per_host;
+  size_t connections_per_frontend;
+  size_t request_buffer_size;
+  size_t response_buffer_size;
+  // Address family of backend connection.  One of either AF_INET,
+  // AF_INET6 or AF_UNSPEC.  This is ignored if backend connection
+  // is made via Unix domain socket.
+  int family;
 };
 
 struct ConnectionConfig {
@@ -604,86 +767,260 @@ struct ConnectionConfig {
     bool accept_proxy_protocol;
   } upstream;
 
-  struct {
-    struct {
-      ev_tstamp read;
-      ev_tstamp write;
-      ev_tstamp idle_read;
-    } timeout;
-    std::vector<DownstreamAddrGroupConfig> addr_groups;
-    // The index of catch-all group in downstream_addr_groups.
-    size_t addr_group_catch_all;
-    size_t connections_per_host;
-    size_t connections_per_frontend;
-    size_t request_buffer_size;
-    size_t response_buffer_size;
-    // Address family of backend connection.  One of either AF_INET,
-    // AF_INET6 or AF_UNSPEC.  This is ignored if backend connection
-    // is made via Unix domain socket.
-    int family;
-  } downstream;
+  std::shared_ptr<DownstreamConfig> downstream;
 };
 
-// Wildcard host pattern routing.  We strips left most '*' from host
-// field.  router includes all path pattern sharing same wildcard
-// host.
-struct WildcardPattern {
-  ImmutableString host;
-  Router router;
+struct APIConfig {
+  // Maximum request body size for one API request
+  size_t max_request_body;
+  // true if at least one of UpstreamAddr has api enabled
+  bool enabled;
 };
 
 struct Config {
-  Router router;
-  std::vector<WildcardPattern> wildcard_patterns;
+  Config()
+      : balloc(4096, 4096),
+        downstream_http_proxy{},
+        http{},
+        http2{},
+        tls{},
+        logging{},
+        conn{},
+        api{},
+        num_worker{0},
+        padding{0},
+        rlimit_nofile{0},
+        uid{0},
+        gid{0},
+        pid{0},
+        verbose{false},
+        daemon{false},
+        http2_proxy{false},
+        ev_loop_flags{0} {}
+  ~Config();
+
+  Config(Config &&) = delete;
+  Config(const Config &&) = delete;
+  Config &operator=(Config &&) = delete;
+  Config &operator=(const Config &&) = delete;
+
+  // Allocator to allocate memory for this object except for
+  // DownstreamConfig.  Currently, it is used to allocate memory for
+  // strings.
+  BlockAllocator balloc;
   HttpProxy downstream_http_proxy;
   HttpConfig http;
   Http2Config http2;
   TLSConfig tls;
   LoggingConfig logging;
   ConnectionConfig conn;
-  ImmutableString pid_file;
-  ImmutableString conf_path;
-  ImmutableString user;
-  ImmutableString mruby_file;
-  char **original_argv;
-  char **argv;
-  char *cwd;
+  APIConfig api;
+  StringRef pid_file;
+  StringRef conf_path;
+  StringRef user;
+  StringRef mruby_file;
   size_t num_worker;
   size_t padding;
   size_t rlimit_nofile;
-  int argc;
   uid_t uid;
   gid_t gid;
   pid_t pid;
   bool verbose;
   bool daemon;
   bool http2_proxy;
+  // flags passed to ev_default_loop() and ev_loop_new()
+  int ev_loop_flags;
 };
 
 const Config *get_config();
 Config *mod_config();
+// Replaces the current config with given |new_config|.  The old config is
+// returned.
+std::unique_ptr<Config> replace_config(std::unique_ptr<Config> new_config);
 void create_config();
 
+// generated by gennghttpxfun.py
+enum {
+  SHRPX_OPTID_ACCEPT_PROXY_PROTOCOL,
+  SHRPX_OPTID_ACCESSLOG_FILE,
+  SHRPX_OPTID_ACCESSLOG_FORMAT,
+  SHRPX_OPTID_ACCESSLOG_SYSLOG,
+  SHRPX_OPTID_ADD_FORWARDED,
+  SHRPX_OPTID_ADD_REQUEST_HEADER,
+  SHRPX_OPTID_ADD_RESPONSE_HEADER,
+  SHRPX_OPTID_ADD_X_FORWARDED_FOR,
+  SHRPX_OPTID_ALTSVC,
+  SHRPX_OPTID_API_MAX_REQUEST_BODY,
+  SHRPX_OPTID_BACKEND,
+  SHRPX_OPTID_BACKEND_ADDRESS_FAMILY,
+  SHRPX_OPTID_BACKEND_CONNECT_TIMEOUT,
+  SHRPX_OPTID_BACKEND_CONNECTIONS_PER_FRONTEND,
+  SHRPX_OPTID_BACKEND_CONNECTIONS_PER_HOST,
+  SHRPX_OPTID_BACKEND_HTTP_PROXY_URI,
+  SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND,
+  SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_HOST,
+  SHRPX_OPTID_BACKEND_HTTP1_TLS,
+  SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_BITS,
+  SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_SIZE,
+  SHRPX_OPTID_BACKEND_HTTP2_CONNECTIONS_PER_WORKER,
+  SHRPX_OPTID_BACKEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE,
+  SHRPX_OPTID_BACKEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE,
+  SHRPX_OPTID_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS,
+  SHRPX_OPTID_BACKEND_HTTP2_SETTINGS_TIMEOUT,
+  SHRPX_OPTID_BACKEND_HTTP2_WINDOW_BITS,
+  SHRPX_OPTID_BACKEND_HTTP2_WINDOW_SIZE,
+  SHRPX_OPTID_BACKEND_IPV4,
+  SHRPX_OPTID_BACKEND_IPV6,
+  SHRPX_OPTID_BACKEND_KEEP_ALIVE_TIMEOUT,
+  SHRPX_OPTID_BACKEND_MAX_BACKOFF,
+  SHRPX_OPTID_BACKEND_NO_TLS,
+  SHRPX_OPTID_BACKEND_READ_TIMEOUT,
+  SHRPX_OPTID_BACKEND_REQUEST_BUFFER,
+  SHRPX_OPTID_BACKEND_RESPONSE_BUFFER,
+  SHRPX_OPTID_BACKEND_TLS,
+  SHRPX_OPTID_BACKEND_TLS_SNI_FIELD,
+  SHRPX_OPTID_BACKEND_WRITE_TIMEOUT,
+  SHRPX_OPTID_BACKLOG,
+  SHRPX_OPTID_CACERT,
+  SHRPX_OPTID_CERTIFICATE_FILE,
+  SHRPX_OPTID_CIPHERS,
+  SHRPX_OPTID_CLIENT,
+  SHRPX_OPTID_CLIENT_CERT_FILE,
+  SHRPX_OPTID_CLIENT_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_CLIENT_PROXY,
+  SHRPX_OPTID_CONF,
+  SHRPX_OPTID_DAEMON,
+  SHRPX_OPTID_DH_PARAM_FILE,
+  SHRPX_OPTID_ECDH_CURVES,
+  SHRPX_OPTID_ERROR_PAGE,
+  SHRPX_OPTID_ERRORLOG_FILE,
+  SHRPX_OPTID_ERRORLOG_SYSLOG,
+  SHRPX_OPTID_FASTOPEN,
+  SHRPX_OPTID_FETCH_OCSP_RESPONSE_FILE,
+  SHRPX_OPTID_FORWARDED_BY,
+  SHRPX_OPTID_FORWARDED_FOR,
+  SHRPX_OPTID_FRONTEND,
+  SHRPX_OPTID_FRONTEND_FRAME_DEBUG,
+  SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS,
+  SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_SIZE,
+  SHRPX_OPTID_FRONTEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE,
+  SHRPX_OPTID_FRONTEND_HTTP2_DUMP_REQUEST_HEADER,
+  SHRPX_OPTID_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER,
+  SHRPX_OPTID_FRONTEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE,
+  SHRPX_OPTID_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS,
+  SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WINDOW_SIZE,
+  SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WRITE_BUFFER_SIZE,
+  SHRPX_OPTID_FRONTEND_HTTP2_READ_TIMEOUT,
+  SHRPX_OPTID_FRONTEND_HTTP2_SETTINGS_TIMEOUT,
+  SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS,
+  SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_SIZE,
+  SHRPX_OPTID_FRONTEND_NO_TLS,
+  SHRPX_OPTID_FRONTEND_READ_TIMEOUT,
+  SHRPX_OPTID_FRONTEND_WRITE_TIMEOUT,
+  SHRPX_OPTID_HEADER_FIELD_BUFFER,
+  SHRPX_OPTID_HOST_REWRITE,
+  SHRPX_OPTID_HTTP2_BRIDGE,
+  SHRPX_OPTID_HTTP2_MAX_CONCURRENT_STREAMS,
+  SHRPX_OPTID_HTTP2_NO_COOKIE_CRUMBLING,
+  SHRPX_OPTID_HTTP2_PROXY,
+  SHRPX_OPTID_INCLUDE,
+  SHRPX_OPTID_INSECURE,
+  SHRPX_OPTID_LISTENER_DISABLE_TIMEOUT,
+  SHRPX_OPTID_LOG_LEVEL,
+  SHRPX_OPTID_MAX_HEADER_FIELDS,
+  SHRPX_OPTID_MAX_REQUEST_HEADER_FIELDS,
+  SHRPX_OPTID_MAX_RESPONSE_HEADER_FIELDS,
+  SHRPX_OPTID_MRUBY_FILE,
+  SHRPX_OPTID_NO_HOST_REWRITE,
+  SHRPX_OPTID_NO_HTTP2_CIPHER_BLACK_LIST,
+  SHRPX_OPTID_NO_KQUEUE,
+  SHRPX_OPTID_NO_LOCATION_REWRITE,
+  SHRPX_OPTID_NO_OCSP,
+  SHRPX_OPTID_NO_SERVER_PUSH,
+  SHRPX_OPTID_NO_SERVER_REWRITE,
+  SHRPX_OPTID_NO_VIA,
+  SHRPX_OPTID_NPN_LIST,
+  SHRPX_OPTID_OCSP_UPDATE_INTERVAL,
+  SHRPX_OPTID_PADDING,
+  SHRPX_OPTID_PID_FILE,
+  SHRPX_OPTID_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_PRIVATE_KEY_PASSWD_FILE,
+  SHRPX_OPTID_READ_BURST,
+  SHRPX_OPTID_READ_RATE,
+  SHRPX_OPTID_REQUEST_HEADER_FIELD_BUFFER,
+  SHRPX_OPTID_RESPONSE_HEADER_FIELD_BUFFER,
+  SHRPX_OPTID_RLIMIT_NOFILE,
+  SHRPX_OPTID_SERVER_NAME,
+  SHRPX_OPTID_STREAM_READ_TIMEOUT,
+  SHRPX_OPTID_STREAM_WRITE_TIMEOUT,
+  SHRPX_OPTID_STRIP_INCOMING_FORWARDED,
+  SHRPX_OPTID_STRIP_INCOMING_X_FORWARDED_FOR,
+  SHRPX_OPTID_SUBCERT,
+  SHRPX_OPTID_SYSLOG_FACILITY,
+  SHRPX_OPTID_TLS_DYN_REC_IDLE_TIMEOUT,
+  SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD,
+  SHRPX_OPTID_TLS_PROTO_LIST,
+  SHRPX_OPTID_TLS_SCT_DIR,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS,
+  SHRPX_OPTID_TLS_TICKET_KEY_CIPHER,
+  SHRPX_OPTID_TLS_TICKET_KEY_FILE,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_INTERVAL,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS,
+  SHRPX_OPTID_USER,
+  SHRPX_OPTID_VERIFY_CLIENT,
+  SHRPX_OPTID_VERIFY_CLIENT_CACERT,
+  SHRPX_OPTID_WORKER_FRONTEND_CONNECTIONS,
+  SHRPX_OPTID_WORKER_READ_BURST,
+  SHRPX_OPTID_WORKER_READ_RATE,
+  SHRPX_OPTID_WORKER_WRITE_BURST,
+  SHRPX_OPTID_WORKER_WRITE_RATE,
+  SHRPX_OPTID_WORKERS,
+  SHRPX_OPTID_WRITE_BURST,
+  SHRPX_OPTID_WRITE_RATE,
+  SHRPX_OPTID_MAXIDX,
+};
+
+// Looks up token for given option name |name| of length |namelen|.
+int option_lookup_token(const char *name, size_t namelen);
+
 // Parses option name |opt| and value |optarg|.  The results are
-// stored into statically allocated Config object. This function
-// returns 0 if it succeeds, or -1.  The |included_set| contains the
-// all paths already included while processing this configuration, to
-// avoid loop in --include option.
-int parse_config(const StringRef &opt, const StringRef &optarg,
+// stored into the object pointed by |config|. This function returns 0
+// if it succeeds, or -1.  The |included_set| contains the all paths
+// already included while processing this configuration, to avoid loop
+// in --include option.
+int parse_config(Config *config, const StringRef &opt, const StringRef &optarg,
                  std::set<StringRef> &included_set);
 
-// Loads configurations from |filename| and stores them in statically
-// allocated Config object. This function returns 0 if it succeeds, or
-// -1.  See parse_config() for |include_set|.
-int load_config(const char *filename, std::set<StringRef> &include_set);
+// Similar to parse_config() above, but additional |optid| which
+// should be the return value of option_lookup_token(opt).
+int parse_config(Config *config, int optid, const StringRef &opt,
+                 const StringRef &optarg, std::set<StringRef> &included_set);
+
+// Loads configurations from |filename| and stores them in |config|.
+// This function returns 0 if it succeeds, or -1.  See parse_config()
+// for |include_set|.
+int load_config(Config *config, const char *filename,
+                std::set<StringRef> &include_set);
 
 // Parses header field in |optarg|.  We expect header field is formed
 // like "NAME: VALUE".  We require that NAME is non empty string.  ":"
 // is allowed at the start of the NAME, but NAME == ":" is not
 // allowed.  This function returns pair of NAME and VALUE.
-Headers::value_type parse_header(const StringRef &optarg);
+HeaderRefs::value_type parse_header(BlockAllocator &balloc,
+                                    const StringRef &optarg);
 
-std::vector<LogFragment> parse_log_format(const StringRef &optarg);
+std::vector<LogFragment> parse_log_format(BlockAllocator &balloc,
+                                          const StringRef &optarg);
 
 // Returns string for syslog |facility|.
 StringRef str_syslog_facility(int facility);
@@ -698,11 +1035,18 @@ FILE *open_file_for_write(const char *filename);
 // expected file size.  This function returns TicketKey if it
 // succeeds, or nullptr.
 std::unique_ptr<TicketKeys>
-read_tls_ticket_key_file(const std::vector<std::string> &files,
+read_tls_ticket_key_file(const std::vector<StringRef> &files,
                          const EVP_CIPHER *cipher, const EVP_MD *hmac);
 
 // Returns string representation of |proto|.
 StringRef strproto(shrpx_proto proto);
+
+int configure_downstream_group(Config *config, bool http2_proxy,
+                               bool numeric_addr_only,
+                               const TLSConfig &tlsconf);
+
+int resolve_hostname(Address *addr, const char *hostname, uint16_t port,
+                     int family, int additional_flags = 0);
 
 } // namespace shrpx
 

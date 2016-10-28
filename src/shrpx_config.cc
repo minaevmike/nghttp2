@@ -41,6 +41,7 @@
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif // HAVE_UNISTD_H
+#include <dirent.h>
 
 #include <cstring>
 #include <cerrno>
@@ -56,20 +57,50 @@
 #include "shrpx_http.h"
 #include "util.h"
 #include "base64.h"
+#include "ssl_compat.h"
+#include "xsi_strerror.h"
 
 namespace shrpx {
 
 namespace {
-Config *config = nullptr;
+std::unique_ptr<Config> config;
 } // namespace
 
 constexpr auto SHRPX_UNIX_PATH_PREFIX = StringRef::from_lit("unix:");
 
-const Config *get_config() { return config; }
+const Config *get_config() { return config.get(); }
 
-Config *mod_config() { return config; }
+Config *mod_config() { return config.get(); }
 
-void create_config() { config = new Config(); }
+std::unique_ptr<Config> replace_config(std::unique_ptr<Config> another) {
+  config.swap(another);
+  return another;
+}
+
+void create_config() { config = make_unique<Config>(); }
+
+Config::~Config() {
+  auto &upstreamconf = http2.upstream;
+
+  nghttp2_option_del(upstreamconf.option);
+  nghttp2_option_del(upstreamconf.alt_mode_option);
+  nghttp2_session_callbacks_del(upstreamconf.callbacks);
+
+  auto &downstreamconf = http2.downstream;
+
+  nghttp2_option_del(downstreamconf.option);
+  nghttp2_session_callbacks_del(downstreamconf.callbacks);
+
+  auto &dumpconf = http2.upstream.debug.dump;
+
+  if (dumpconf.request_header) {
+    fclose(dumpconf.request_header);
+  }
+
+  if (dumpconf.response_header) {
+    fclose(dumpconf.response_header);
+  }
+}
 
 TicketKeys::~TicketKeys() {
   /* Erase keys from memory */
@@ -123,7 +154,7 @@ bool is_secure(const StringRef &filename) {
 } // namespace
 
 std::unique_ptr<TicketKeys>
-read_tls_ticket_key_file(const std::vector<std::string> &files,
+read_tls_ticket_key_file(const std::vector<StringRef> &files,
                          const EVP_CIPHER *cipher, const EVP_MD *hmac) {
   auto ticket_keys = make_unique<TicketKeys>();
   auto &keys = ticket_keys->keys;
@@ -195,6 +226,8 @@ read_tls_ticket_key_file(const std::vector<std::string> &files,
 }
 
 FILE *open_file_for_write(const char *filename) {
+  std::array<char, STRERROR_BUFSIZE> errbuf;
+
 #if defined O_CLOEXEC
   auto fd = open(filename, O_WRONLY | O_CLOEXEC | O_CREAT | O_TRUNC,
                  S_IRUSR | S_IWUSR);
@@ -207,14 +240,16 @@ FILE *open_file_for_write(const char *filename) {
   }
 #endif
   if (fd == -1) {
-    LOG(ERROR) << "Failed to open " << filename
-               << " for writing. Cause: " << strerror(errno);
+    auto error = errno;
+    LOG(ERROR) << "Failed to open " << filename << " for writing. Cause: "
+               << xsi_strerror(error, errbuf.data(), errbuf.size());
     return nullptr;
   }
   auto f = fdopen(fd, "wb");
   if (f == nullptr) {
-    LOG(ERROR) << "Failed to open " << filename
-               << " for writing. Cause: " << strerror(errno);
+    auto error = errno;
+    LOG(ERROR) << "Failed to open " << filename << " for writing. Cause: "
+               << xsi_strerror(error, errbuf.data(), errbuf.size());
     return nullptr;
   }
 
@@ -244,29 +279,35 @@ std::string read_passwd_from_file(const StringRef &opt,
 }
 } // namespace
 
-Headers::value_type parse_header(const StringRef &optarg) {
+HeaderRefs::value_type parse_header(BlockAllocator &balloc,
+                                    const StringRef &optarg) {
   auto colon = std::find(std::begin(optarg), std::end(optarg), ':');
 
   if (colon == std::end(optarg) || colon == std::begin(optarg)) {
-    return {"", ""};
+    return {};
   }
 
   auto value = colon + 1;
   for (; *value == '\t' || *value == ' '; ++value)
     ;
 
-  auto p = Header(std::string{std::begin(optarg), colon},
-                  std::string{value, std::end(optarg)});
-  util::inp_strlower(p.name);
+  auto name_iov =
+      make_byte_ref(balloc, std::distance(std::begin(optarg), colon) + 1);
+  auto p = name_iov.base;
+  p = std::copy(std::begin(optarg), colon, p);
+  util::inp_strlower(name_iov.base, p);
+  *p = '\0';
 
-  if (!nghttp2_check_header_name(
-          reinterpret_cast<const uint8_t *>(p.name.c_str()), p.name.size()) ||
-      !nghttp2_check_header_value(
-          reinterpret_cast<const uint8_t *>(p.value.c_str()), p.value.size())) {
-    return Header{};
+  auto nv =
+      HeaderRef(StringRef{name_iov.base, p},
+                make_string_ref(balloc, StringRef{value, std::end(optarg)}));
+
+  if (!nghttp2_check_header_name(nv.name.byte(), nv.name.size()) ||
+      !nghttp2_check_header_value(nv.value.byte(), nv.value.size())) {
+    return {};
   }
 
-  return p;
+  return nv;
 }
 
 template <typename T>
@@ -289,6 +330,14 @@ int parse_uint_with_unit(T *dest, const StringRef &opt,
   auto n = util::parse_uint_with_unit(optarg);
   if (n == -1) {
     LOG(ERROR) << opt << ": bad value: '" << optarg << "'";
+    return -1;
+  }
+
+  if (static_cast<uint64_t>(std::numeric_limits<T>::max()) <
+      static_cast<uint64_t>(n)) {
+    LOG(ERROR) << opt
+               << ": too large.  The value should be less than or equal to "
+               << std::numeric_limits<T>::max();
     return -1;
   }
 
@@ -406,6 +455,14 @@ LogFragmentType log_var_lookup_token(const char *name, size_t namelen) {
         return SHRPX_LOGF_SSL_PROTOCOL;
       }
       break;
+    case 't':
+      if (util::strieq_l("backend_hos", name, 11)) {
+        return SHRPX_LOGF_BACKEND_HOST;
+      }
+      if (util::strieq_l("backend_por", name, 11)) {
+        return SHRPX_LOGF_BACKEND_PORT;
+      }
+      break;
     }
     break;
   case 14:
@@ -446,7 +503,8 @@ bool var_token(char c) {
 }
 } // namespace
 
-std::vector<LogFragment> parse_log_format(const StringRef &optarg) {
+std::vector<LogFragment> parse_log_format(BlockAllocator &balloc,
+                                          const StringRef &optarg) {
   auto literal_start = std::begin(optarg);
   auto p = literal_start;
   auto eop = std::end(optarg);
@@ -509,8 +567,9 @@ std::vector<LogFragment> parse_log_format(const StringRef &optarg) {
     }
 
     if (literal_start < var_start) {
-      res.emplace_back(SHRPX_LOGF_LITERAL,
-                       ImmutableString(literal_start, var_start));
+      res.emplace_back(
+          SHRPX_LOGF_LITERAL,
+          make_string_ref(balloc, StringRef{literal_start, var_start}));
     }
 
     literal_start = p;
@@ -520,18 +579,24 @@ std::vector<LogFragment> parse_log_format(const StringRef &optarg) {
       continue;
     }
 
-    auto name = std::string(value, var_name + var_namelen);
-    for (auto &c : name) {
-      if (c == '_') {
-        c = '-';
+    {
+      auto iov = make_byte_ref(
+          balloc, std::distance(value, var_name + var_namelen) + 1);
+      auto p = iov.base;
+      p = std::copy(value, var_name + var_namelen, p);
+      for (auto cp = iov.base; cp != p; ++cp) {
+        if (*cp == '_') {
+          *cp = '-';
+        }
       }
+      *p = '\0';
+      res.emplace_back(type, StringRef{iov.base, p});
     }
-
-    res.emplace_back(type, ImmutableString(name));
   }
 
   if (literal_start != eop) {
-    res.emplace_back(SHRPX_LOGF_LITERAL, ImmutableString(literal_start, eop));
+    res.emplace_back(SHRPX_LOGF_LITERAL,
+                     make_string_ref(balloc, StringRef{literal_start, eop}));
   }
 
   return res;
@@ -610,6 +675,7 @@ int parse_memcached_connection_params(MemcachedConnectionParams &out,
 } // namespace
 
 struct UpstreamParams {
+  int alt_mode;
   bool tls;
 };
 
@@ -627,6 +693,18 @@ int parse_upstream_params(UpstreamParams &out, const StringRef &src_params) {
       out.tls = true;
     } else if (util::strieq_l("no-tls", param)) {
       out.tls = false;
+    } else if (util::strieq_l("api", param)) {
+      if (out.alt_mode && out.alt_mode != ALTMODE_API) {
+        LOG(ERROR) << "frontend: api and healthmon are mutually exclusive";
+        return -1;
+      }
+      out.alt_mode = ALTMODE_API;
+    } else if (util::strieq_l("healthmon", param)) {
+      if (out.alt_mode && out.alt_mode != ALTMODE_HEALTHMON) {
+        LOG(ERROR) << "frontend: api and healthmon are mutually exclusive";
+        return -1;
+      }
+      out.alt_mode = ALTMODE_HEALTHMON;
     } else if (!param.empty()) {
       LOG(ERROR) << "frontend: " << param << ": unknown keyword";
       return -1;
@@ -644,9 +722,11 @@ int parse_upstream_params(UpstreamParams &out, const StringRef &src_params) {
 } // namespace
 
 struct DownstreamParams {
+  StringRef sni;
   size_t fall;
   size_t rise;
   shrpx_proto proto;
+  shrpx_session_affinity affinity;
   bool tls;
 };
 
@@ -709,6 +789,18 @@ int parse_downstream_params(DownstreamParams &out,
       out.tls = true;
     } else if (util::strieq_l("no-tls", param)) {
       out.tls = false;
+    } else if (util::istarts_with_l(param, "sni=")) {
+      out.sni = StringRef{first + str_size("sni="), end};
+    } else if (util::istarts_with_l(param, "affinity=")) {
+      auto valstr = StringRef{first + str_size("affinity="), end};
+      if (util::strieq_l("none", valstr)) {
+        out.affinity = AFFINITY_NONE;
+      } else if (util::strieq_l("ip", valstr)) {
+        out.affinity = AFFINITY_IP;
+      } else {
+        LOG(ERROR) << "backend: affinity: value must be either none or ip";
+        return -1;
+      }
     } else if (!param.empty()) {
       LOG(ERROR) << "backend: " << param << ": unknown keyword";
       return -1;
@@ -733,13 +825,14 @@ namespace {
 // as catch-all.  We also parse protocol specified in |src_proto|.
 //
 // This function returns 0 if it succeeds, or -1.
-int parse_mapping(DownstreamAddrConfig addr, const StringRef &src_pattern,
-                  const StringRef &src_params) {
+int parse_mapping(Config *config, DownstreamAddrConfig &addr,
+                  const StringRef &src_pattern, const StringRef &src_params) {
   // This returns at least 1 element (it could be empty string).  We
   // will append '/' to all patterns, so it becomes catch-all pattern.
   auto mapping = util::split_str(src_pattern, ':');
   assert(!mapping.empty());
-  auto &addr_groups = mod_config()->conn.downstream.addr_groups;
+  auto &downstreamconf = *config->conn.downstream;
+  auto &addr_groups = downstreamconf.addr_groups;
 
   DownstreamParams params{};
   params.proto = PROTO_HTTP1;
@@ -750,39 +843,50 @@ int parse_mapping(DownstreamAddrConfig addr, const StringRef &src_pattern,
 
   addr.fall = params.fall;
   addr.rise = params.rise;
+  addr.proto = params.proto;
+  addr.tls = params.tls;
+  addr.sni = make_string_ref(downstreamconf.balloc, params.sni);
+
+  auto &routerconf = downstreamconf.router;
+  auto &router = routerconf.router;
+  auto &rw_router = routerconf.rev_wildcard_router;
+  auto &wildcard_patterns = routerconf.wildcard_patterns;
 
   for (const auto &raw_pattern : mapping) {
     auto done = false;
-    std::string pattern;
+    StringRef pattern;
     auto slash = std::find(std::begin(raw_pattern), std::end(raw_pattern), '/');
     if (slash == std::end(raw_pattern)) {
-      // This effectively makes empty pattern to "/".
-      pattern.assign(std::begin(raw_pattern), std::end(raw_pattern));
-      util::inp_strlower(pattern);
-      pattern += '/';
+      // This effectively makes empty pattern to "/".  2 for '/' and
+      // terminal NULL character.
+      auto iov = make_byte_ref(downstreamconf.balloc, raw_pattern.size() + 2);
+      auto p = iov.base;
+      p = std::copy(std::begin(raw_pattern), std::end(raw_pattern), p);
+      util::inp_strlower(iov.base, p);
+      *p++ = '/';
+      *p = '\0';
+      pattern = StringRef{iov.base, p};
     } else {
-      pattern.assign(std::begin(raw_pattern), slash);
-      util::inp_strlower(pattern);
-      pattern += http2::normalize_path(StringRef{slash, std::end(raw_pattern)},
-                                       StringRef{});
+      auto path = http2::normalize_path(downstreamconf.balloc,
+                                        StringRef{slash, std::end(raw_pattern)},
+                                        StringRef{});
+      auto iov = make_byte_ref(downstreamconf.balloc,
+                               std::distance(std::begin(raw_pattern), slash) +
+                                   path.size() + 1);
+      auto p = iov.base;
+      p = std::copy(std::begin(raw_pattern), slash, p);
+      util::inp_strlower(iov.base, p);
+      p = std::copy(std::begin(path), std::end(path), p);
+      *p = '\0';
+      pattern = StringRef{iov.base, p};
     }
     for (auto &g : addr_groups) {
       if (g.pattern == pattern) {
-        if (g.proto != params.proto) {
-          LOG(ERROR) << "backend: protocol mismatch.  We saw protocol "
-                     << strproto(g.proto) << " for pattern " << g.pattern
-                     << ", but another protocol " << strproto(params.proto);
-          return -1;
+        // Last value wins if we have multiple different affinity
+        // value under one group.
+        if (params.affinity != AFFINITY_NONE) {
+          g.affinity = params.affinity;
         }
-
-        if (g.tls != params.tls) {
-          LOG(ERROR) << "backend: TLS mismatch.  We saw TLS was "
-                     << (g.tls ? "enabled" : "disabled") << " for pattern "
-                     << g.pattern << ", but we now got TLS was "
-                     << (params.tls ? "enabled" : "disabled");
-          return -1;
-        }
-
         g.addrs.push_back(addr);
         done = true;
         break;
@@ -791,10 +895,12 @@ int parse_mapping(DownstreamAddrConfig addr, const StringRef &src_pattern,
     if (done) {
       continue;
     }
-    DownstreamAddrGroupConfig g(StringRef{pattern});
+
+    auto idx = addr_groups.size();
+    addr_groups.emplace_back(pattern);
+    auto &g = addr_groups.back();
     g.addrs.push_back(addr);
-    g.proto = params.proto;
-    g.tls = params.tls;
+    g.affinity = params.affinity;
 
     if (pattern[0] == '*') {
       // wildcard pattern
@@ -804,26 +910,31 @@ int parse_mapping(DownstreamAddrConfig addr, const StringRef &src_pattern,
       auto host = StringRef{std::begin(g.pattern) + 1, path_first};
       auto path = StringRef{path_first, std::end(g.pattern)};
 
-      auto &wildcard_patterns = mod_config()->wildcard_patterns;
-
       auto it = std::find_if(
           std::begin(wildcard_patterns), std::end(wildcard_patterns),
           [&host](const WildcardPattern &wp) { return wp.host == host; });
 
       if (it == std::end(wildcard_patterns)) {
-        mod_config()->wildcard_patterns.push_back(
-            {ImmutableString{std::begin(host), std::end(host)}});
+        wildcard_patterns.emplace_back(host);
 
-        auto &router = mod_config()->wildcard_patterns.back().router;
-        router.add_route(path, addr_groups.size());
+        auto &router = wildcard_patterns.back().router;
+        router.add_route(path, idx);
+
+        auto iov = make_byte_ref(downstreamconf.balloc, host.size() + 1);
+        auto p = iov.base;
+        p = std::reverse_copy(std::begin(host), std::end(host), p);
+        *p = '\0';
+        auto rev_host = StringRef{iov.base, p};
+
+        rw_router.add_route(rev_host, wildcard_patterns.size() - 1);
       } else {
-        (*it).router.add_route(path, addr_groups.size());
+        (*it).router.add_route(path, idx);
       }
-    } else {
-      mod_config()->router.add_route(StringRef{g.pattern}, addr_groups.size());
+
+      continue;
     }
 
-    addr_groups.push_back(std::move(g));
+    router.add_route(g.pattern, idx);
   }
   return 0;
 }
@@ -857,6 +968,8 @@ int parse_forwarded_node_type(const StringRef &optarg) {
 namespace {
 int parse_error_page(std::vector<ErrorPage> &error_pages, const StringRef &opt,
                      const StringRef &optarg) {
+  std::array<char, STRERROR_BUFSIZE> errbuf;
+
   auto eq = std::find(std::begin(optarg), std::end(optarg), '=');
   if (eq == std::end(optarg) || eq + 1 == std::end(optarg)) {
     LOG(ERROR) << opt << ": bad value: '" << optarg << "'";
@@ -885,7 +998,8 @@ int parse_error_page(std::vector<ErrorPage> &error_pages, const StringRef &opt,
   auto fd = open(path.c_str(), O_RDONLY);
   if (fd == -1) {
     auto error = errno;
-    LOG(ERROR) << opt << ": " << optarg << ": " << strerror(error);
+    LOG(ERROR) << opt << ": " << optarg << ": "
+               << xsi_strerror(error, errbuf.data(), errbuf.size());
     return -1;
   }
 
@@ -896,7 +1010,8 @@ int parse_error_page(std::vector<ErrorPage> &error_pages, const StringRef &opt,
     auto n = read(fd, buf.data(), buf.size());
     if (n == -1) {
       auto error = errno;
-      LOG(ERROR) << opt << ": " << optarg << ": " << strerror(error);
+      LOG(ERROR) << opt << ": " << optarg << ": "
+                 << xsi_strerror(error, errbuf.data(), errbuf.size());
       return -1;
     }
     if (n == 0) {
@@ -911,138 +1026,167 @@ int parse_error_page(std::vector<ErrorPage> &error_pages, const StringRef &opt,
 }
 } // namespace
 
-// generated by gennghttpxfun.py
-enum {
-  SHRPX_OPTID_ACCEPT_PROXY_PROTOCOL,
-  SHRPX_OPTID_ACCESSLOG_FILE,
-  SHRPX_OPTID_ACCESSLOG_FORMAT,
-  SHRPX_OPTID_ACCESSLOG_SYSLOG,
-  SHRPX_OPTID_ADD_FORWARDED,
-  SHRPX_OPTID_ADD_REQUEST_HEADER,
-  SHRPX_OPTID_ADD_RESPONSE_HEADER,
-  SHRPX_OPTID_ADD_X_FORWARDED_FOR,
-  SHRPX_OPTID_ALTSVC,
-  SHRPX_OPTID_BACKEND,
-  SHRPX_OPTID_BACKEND_ADDRESS_FAMILY,
-  SHRPX_OPTID_BACKEND_CONNECTIONS_PER_FRONTEND,
-  SHRPX_OPTID_BACKEND_CONNECTIONS_PER_HOST,
-  SHRPX_OPTID_BACKEND_HTTP_PROXY_URI,
-  SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND,
-  SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_HOST,
-  SHRPX_OPTID_BACKEND_HTTP1_TLS,
-  SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_BITS,
-  SHRPX_OPTID_BACKEND_HTTP2_CONNECTIONS_PER_WORKER,
-  SHRPX_OPTID_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS,
-  SHRPX_OPTID_BACKEND_HTTP2_WINDOW_BITS,
-  SHRPX_OPTID_BACKEND_IPV4,
-  SHRPX_OPTID_BACKEND_IPV6,
-  SHRPX_OPTID_BACKEND_KEEP_ALIVE_TIMEOUT,
-  SHRPX_OPTID_BACKEND_NO_TLS,
-  SHRPX_OPTID_BACKEND_READ_TIMEOUT,
-  SHRPX_OPTID_BACKEND_REQUEST_BUFFER,
-  SHRPX_OPTID_BACKEND_RESPONSE_BUFFER,
-  SHRPX_OPTID_BACKEND_TLS,
-  SHRPX_OPTID_BACKEND_TLS_SNI_FIELD,
-  SHRPX_OPTID_BACKEND_WRITE_TIMEOUT,
-  SHRPX_OPTID_BACKLOG,
-  SHRPX_OPTID_CACERT,
-  SHRPX_OPTID_CERTIFICATE_FILE,
-  SHRPX_OPTID_CIPHERS,
-  SHRPX_OPTID_CLIENT,
-  SHRPX_OPTID_CLIENT_CERT_FILE,
-  SHRPX_OPTID_CLIENT_PRIVATE_KEY_FILE,
-  SHRPX_OPTID_CLIENT_PROXY,
-  SHRPX_OPTID_CONF,
-  SHRPX_OPTID_DAEMON,
-  SHRPX_OPTID_DH_PARAM_FILE,
-  SHRPX_OPTID_ERROR_PAGE,
-  SHRPX_OPTID_ERRORLOG_FILE,
-  SHRPX_OPTID_ERRORLOG_SYSLOG,
-  SHRPX_OPTID_FASTOPEN,
-  SHRPX_OPTID_FETCH_OCSP_RESPONSE_FILE,
-  SHRPX_OPTID_FORWARDED_BY,
-  SHRPX_OPTID_FORWARDED_FOR,
-  SHRPX_OPTID_FRONTEND,
-  SHRPX_OPTID_FRONTEND_FRAME_DEBUG,
-  SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS,
-  SHRPX_OPTID_FRONTEND_HTTP2_DUMP_REQUEST_HEADER,
-  SHRPX_OPTID_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER,
-  SHRPX_OPTID_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS,
-  SHRPX_OPTID_FRONTEND_HTTP2_READ_TIMEOUT,
-  SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS,
-  SHRPX_OPTID_FRONTEND_NO_TLS,
-  SHRPX_OPTID_FRONTEND_READ_TIMEOUT,
-  SHRPX_OPTID_FRONTEND_WRITE_TIMEOUT,
-  SHRPX_OPTID_HEADER_FIELD_BUFFER,
-  SHRPX_OPTID_HOST_REWRITE,
-  SHRPX_OPTID_HTTP2_BRIDGE,
-  SHRPX_OPTID_HTTP2_MAX_CONCURRENT_STREAMS,
-  SHRPX_OPTID_HTTP2_NO_COOKIE_CRUMBLING,
-  SHRPX_OPTID_HTTP2_PROXY,
-  SHRPX_OPTID_INCLUDE,
-  SHRPX_OPTID_INSECURE,
-  SHRPX_OPTID_LISTENER_DISABLE_TIMEOUT,
-  SHRPX_OPTID_LOG_LEVEL,
-  SHRPX_OPTID_MAX_HEADER_FIELDS,
-  SHRPX_OPTID_MAX_REQUEST_HEADER_FIELDS,
-  SHRPX_OPTID_MAX_RESPONSE_HEADER_FIELDS,
-  SHRPX_OPTID_MRUBY_FILE,
-  SHRPX_OPTID_NO_HOST_REWRITE,
-  SHRPX_OPTID_NO_HTTP2_CIPHER_BLACK_LIST,
-  SHRPX_OPTID_NO_LOCATION_REWRITE,
-  SHRPX_OPTID_NO_OCSP,
-  SHRPX_OPTID_NO_SERVER_PUSH,
-  SHRPX_OPTID_NO_VIA,
-  SHRPX_OPTID_NPN_LIST,
-  SHRPX_OPTID_OCSP_UPDATE_INTERVAL,
-  SHRPX_OPTID_PADDING,
-  SHRPX_OPTID_PID_FILE,
-  SHRPX_OPTID_PRIVATE_KEY_FILE,
-  SHRPX_OPTID_PRIVATE_KEY_PASSWD_FILE,
-  SHRPX_OPTID_READ_BURST,
-  SHRPX_OPTID_READ_RATE,
-  SHRPX_OPTID_REQUEST_HEADER_FIELD_BUFFER,
-  SHRPX_OPTID_RESPONSE_HEADER_FIELD_BUFFER,
-  SHRPX_OPTID_RLIMIT_NOFILE,
-  SHRPX_OPTID_STREAM_READ_TIMEOUT,
-  SHRPX_OPTID_STREAM_WRITE_TIMEOUT,
-  SHRPX_OPTID_STRIP_INCOMING_FORWARDED,
-  SHRPX_OPTID_STRIP_INCOMING_X_FORWARDED_FOR,
-  SHRPX_OPTID_SUBCERT,
-  SHRPX_OPTID_SYSLOG_FACILITY,
-  SHRPX_OPTID_TLS_DYN_REC_IDLE_TIMEOUT,
-  SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD,
-  SHRPX_OPTID_TLS_PROTO_LIST,
-  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED,
-  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY,
-  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE,
-  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE,
-  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS,
-  SHRPX_OPTID_TLS_TICKET_KEY_CIPHER,
-  SHRPX_OPTID_TLS_TICKET_KEY_FILE,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_INTERVAL,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE,
-  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS,
-  SHRPX_OPTID_USER,
-  SHRPX_OPTID_VERIFY_CLIENT,
-  SHRPX_OPTID_VERIFY_CLIENT_CACERT,
-  SHRPX_OPTID_WORKER_FRONTEND_CONNECTIONS,
-  SHRPX_OPTID_WORKER_READ_BURST,
-  SHRPX_OPTID_WORKER_READ_RATE,
-  SHRPX_OPTID_WORKER_WRITE_BURST,
-  SHRPX_OPTID_WORKER_WRITE_RATE,
-  SHRPX_OPTID_WORKERS,
-  SHRPX_OPTID_WRITE_BURST,
-  SHRPX_OPTID_WRITE_RATE,
-  SHRPX_OPTID_MAXIDX,
+namespace {
+// Maximum size of SCT extension payload length.
+constexpr size_t MAX_SCT_EXT_LEN = 16_k;
+} // namespace
+
+struct SubcertParams {
+  StringRef sct_dir;
 };
 
 namespace {
+// Parses subcert parameter |src_params|, and stores parsed results
+// into |out|.  This function returns 0 if it succeeds, or -1.
+int parse_subcert_params(SubcertParams &out, const StringRef &src_params) {
+  auto last = std::end(src_params);
+  for (auto first = std::begin(src_params); first != last;) {
+    auto end = std::find(first, last, ';');
+    auto param = StringRef{first, end};
+
+    if (util::istarts_with_l(param, "sct-dir=")) {
+#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
+      auto sct_dir =
+          StringRef{std::begin(param) + str_size("sct-dir="), std::end(param)};
+      if (sct_dir.empty()) {
+        LOG(ERROR) << "subcert: " << param << ": empty sct-dir";
+        return -1;
+      }
+      out.sct_dir = sct_dir;
+#else  // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
+      LOG(WARN) << "subcert: sct-dir requires OpenSSL >= 1.0.2";
+#endif // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
+    } else if (!param.empty()) {
+      LOG(ERROR) << "subcert: " << param << ": unknown keyword";
+      return -1;
+    }
+
+    if (end == last) {
+      break;
+    }
+
+    first = end + 1;
+  }
+
+  return 0;
+}
+} // namespace
+
+namespace {
+// Reads *.sct files from directory denoted by |dir_path|.  |dir_path|
+// must be NULL-terminated string.
+int read_tls_sct_from_dir(std::vector<uint8_t> &dst, const StringRef &opt,
+                          const StringRef &dir_path) {
+  std::array<char, STRERROR_BUFSIZE> errbuf;
+
+  auto dir = opendir(dir_path.c_str());
+  if (dir == nullptr) {
+    auto error = errno;
+    LOG(ERROR) << opt << ": " << dir_path << ": "
+               << xsi_strerror(error, errbuf.data(), errbuf.size());
+    return -1;
+  }
+
+  auto closer = defer(closedir, dir);
+
+  // 2 bytes total length field
+  auto len_idx = std::distance(std::begin(dst), std::end(dst));
+  dst.insert(std::end(dst), 2, 0);
+
+  for (;;) {
+    errno = 0;
+    auto ent = readdir(dir);
+    if (ent == nullptr) {
+      if (errno != 0) {
+        auto error = errno;
+        LOG(ERROR) << opt << ": failed to read directory " << dir_path << ": "
+                   << xsi_strerror(error, errbuf.data(), errbuf.size());
+        return -1;
+      }
+      break;
+    }
+
+    auto name = StringRef{ent->d_name};
+
+    if (name[0] == '.' || !util::iends_with_l(name, ".sct")) {
+      continue;
+    }
+
+    std::string path;
+    path.resize(dir_path.size() + 1 + name.size());
+    {
+      auto p = std::begin(path);
+      p = std::copy(std::begin(dir_path), std::end(dir_path), p);
+      *p++ = '/';
+      std::copy(std::begin(name), std::end(name), p);
+    }
+
+    auto fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) {
+      auto error = errno;
+      LOG(ERROR) << opt << ": failed to read SCT from " << path << ": "
+                 << xsi_strerror(error, errbuf.data(), errbuf.size());
+      return -1;
+    }
+
+    auto closer = defer(close, fd);
+
+    // 2 bytes length field for this SCT.
+    auto len_idx = std::distance(std::begin(dst), std::end(dst));
+    dst.insert(std::end(dst), 2, 0);
+
+    // *.sct file tends to be small; around 110+ bytes.
+    std::array<char, 256> buf;
+    for (;;) {
+      ssize_t nread;
+      while ((nread = read(fd, buf.data(), buf.size())) == -1 && errno == EINTR)
+        ;
+
+      if (nread == -1) {
+        auto error = errno;
+        LOG(ERROR) << opt << ": failed to read SCT data from " << path << ": "
+                   << xsi_strerror(error, errbuf.data(), errbuf.size());
+        return -1;
+      }
+
+      if (nread == 0) {
+        break;
+      }
+
+      dst.insert(std::end(dst), std::begin(buf), std::begin(buf) + nread);
+
+      if (dst.size() > MAX_SCT_EXT_LEN) {
+        LOG(ERROR) << opt << ": the concatenated SCT data from " << dir_path
+                   << " is too large.  Max " << MAX_SCT_EXT_LEN;
+        return -1;
+      }
+    }
+
+    auto len = dst.size() - len_idx - 2;
+
+    if (len == 0) {
+      dst.resize(dst.size() - 2);
+      continue;
+    }
+
+    dst[len_idx] = len >> 8;
+    dst[len_idx + 1] = len;
+  }
+
+  auto len = dst.size() - len_idx - 2;
+
+  if (len == 0) {
+    dst.resize(dst.size() - 2);
+    return 0;
+  }
+
+  dst[len_idx] = len >> 8;
+  dst[len_idx + 1] = len;
+
+  return 0;
+}
+} // namespace
+
 // generated by gennghttpxfun.py
 int option_lookup_token(const char *name, size_t namelen) {
   switch (namelen) {
@@ -1157,6 +1301,9 @@ int option_lookup_token(const char *name, size_t namelen) {
   case 9:
     switch (name[8]) {
     case 'e':
+      if (util::strieq_l("no-kqueu", name, 8)) {
+        return SHRPX_OPTID_NO_KQUEUE;
+      }
       if (util::strieq_l("read-rat", name, 8)) {
         return SHRPX_OPTID_READ_RATE;
       }
@@ -1190,9 +1337,22 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 11:
     switch (name[10]) {
+    case 'e':
+      if (util::strieq_l("server-nam", name, 10)) {
+        return SHRPX_OPTID_SERVER_NAME;
+      }
+      break;
+    case 'r':
+      if (util::strieq_l("tls-sct-di", name, 10)) {
+        return SHRPX_OPTID_TLS_SCT_DIR;
+      }
+      break;
     case 's':
       if (util::strieq_l("backend-tl", name, 10)) {
         return SHRPX_OPTID_BACKEND_TLS;
+      }
+      if (util::strieq_l("ecdh-curve", name, 10)) {
+        return SHRPX_OPTID_ECDH_CURVES;
       }
       break;
     case 't':
@@ -1346,6 +1506,9 @@ int option_lookup_token(const char *name, size_t namelen) {
   case 17:
     switch (name[16]) {
     case 'e':
+      if (util::strieq_l("no-server-rewrit", name, 16)) {
+        return SHRPX_OPTID_NO_SERVER_REWRITE;
+      }
       if (util::strieq_l("worker-write-rat", name, 16)) {
         return SHRPX_OPTID_WORKER_WRITE_RATE;
       }
@@ -1389,6 +1552,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_TLS_TICKET_KEY_FILE;
       }
       break;
+    case 'f':
+      if (util::strieq_l("backend-max-backof", name, 18)) {
+        return SHRPX_OPTID_BACKEND_MAX_BACKOFF;
+      }
+      break;
     case 'r':
       if (util::strieq_l("add-response-heade", name, 18)) {
         return SHRPX_OPTID_ADD_RESPONSE_HEADER;
@@ -1428,6 +1596,11 @@ int option_lookup_token(const char *name, size_t namelen) {
       }
       if (util::strieq_l("verify-client-cacer", name, 19)) {
         return SHRPX_OPTID_VERIFY_CLIENT_CACERT;
+      }
+      break;
+    case 'y':
+      if (util::strieq_l("api-max-request-bod", name, 19)) {
+        return SHRPX_OPTID_API_MAX_REQUEST_BODY;
       }
       break;
     }
@@ -1498,6 +1671,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_BACKEND_RESPONSE_BUFFER;
       }
       break;
+    case 't':
+      if (util::strieq_l("backend-connect-timeou", name, 22)) {
+        return SHRPX_OPTID_BACKEND_CONNECT_TIMEOUT;
+      }
+      break;
     }
     break;
   case 24:
@@ -1527,6 +1705,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 25:
     switch (name[24]) {
+    case 'e':
+      if (util::strieq_l("backend-http2-window-siz", name, 24)) {
+        return SHRPX_OPTID_BACKEND_HTTP2_WINDOW_SIZE;
+      }
+      break;
     case 'g':
       if (util::strieq_l("http2-no-cookie-crumblin", name, 24)) {
         return SHRPX_OPTID_HTTP2_NO_COOKIE_CRUMBLING;
@@ -1544,6 +1727,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 26:
     switch (name[25]) {
+    case 'e':
+      if (util::strieq_l("frontend-http2-window-siz", name, 25)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_SIZE;
+      }
+      break;
     case 's':
       if (util::strieq_l("frontend-http2-window-bit", name, 25)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS;
@@ -1620,6 +1808,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_STRIP_INCOMING_X_FORWARDED_FOR;
       }
       break;
+    case 't':
+      if (util::strieq_l("backend-http2-settings-timeou", name, 29)) {
+        return SHRPX_OPTID_BACKEND_HTTP2_SETTINGS_TIMEOUT;
+      }
+      break;
     }
     break;
   case 31:
@@ -1627,6 +1820,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 's':
       if (util::strieq_l("tls-session-cache-memcached-tl", name, 30)) {
         return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS;
+      }
+      break;
+    case 't':
+      if (util::strieq_l("frontend-http2-settings-timeou", name, 30)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_SETTINGS_TIMEOUT;
       }
       break;
     }
@@ -1678,6 +1876,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 35:
     switch (name[34]) {
+    case 'e':
+      if (util::strieq_l("frontend-http2-optimize-window-siz", name, 34)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WINDOW_SIZE;
+      }
+      break;
     case 'r':
       if (util::strieq_l("frontend-http2-dump-response-heade", name, 34)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER;
@@ -1687,6 +1890,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 36:
     switch (name[35]) {
+    case 'e':
+      if (util::strieq_l("backend-http2-connection-window-siz", name, 35)) {
+        return SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_SIZE;
+      }
+      break;
     case 'r':
       if (util::strieq_l("backend-http2-connections-per-worke", name, 35)) {
         return SHRPX_OPTID_BACKEND_HTTP2_CONNECTIONS_PER_WORKER;
@@ -1705,6 +1913,9 @@ int option_lookup_token(const char *name, size_t namelen) {
   case 37:
     switch (name[36]) {
     case 'e':
+      if (util::strieq_l("frontend-http2-connection-window-siz", name, 36)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_SIZE;
+      }
       if (util::strieq_l("tls-session-cache-memcached-cert-fil", name, 36)) {
         return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE;
       }
@@ -1737,9 +1948,33 @@ int option_lookup_token(const char *name, size_t namelen) {
       break;
     }
     break;
+  case 40:
+    switch (name[39]) {
+    case 'e':
+      if (util::strieq_l("backend-http2-decoder-dynamic-table-siz", name, 39)) {
+        return SHRPX_OPTID_BACKEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE;
+      }
+      if (util::strieq_l("backend-http2-encoder-dynamic-table-siz", name, 39)) {
+        return SHRPX_OPTID_BACKEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE;
+      }
+      break;
+    }
+    break;
   case 41:
     switch (name[40]) {
     case 'e':
+      if (util::strieq_l("frontend-http2-decoder-dynamic-table-siz", name,
+                         40)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE;
+      }
+      if (util::strieq_l("frontend-http2-encoder-dynamic-table-siz", name,
+                         40)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE;
+      }
+      if (util::strieq_l("frontend-http2-optimize-write-buffer-siz", name,
+                         40)) {
+        return SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WRITE_BUFFER_SIZE;
+      }
       if (util::strieq_l("tls-ticket-key-memcached-private-key-fil", name,
                          40)) {
         return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE;
@@ -1770,23 +2005,29 @@ int option_lookup_token(const char *name, size_t namelen) {
   }
   return -1;
 }
-} // namespace
 
-int parse_config(const StringRef &opt, const StringRef &optarg,
+int parse_config(Config *config, const StringRef &opt, const StringRef &optarg,
                  std::set<StringRef> &included_set) {
+  auto optid = option_lookup_token(opt.c_str(), opt.size());
+  return parse_config(config, optid, opt, optarg, included_set);
+}
+
+int parse_config(Config *config, int optid, const StringRef &opt,
+                 const StringRef &optarg, std::set<StringRef> &included_set) {
+  std::array<char, STRERROR_BUFSIZE> errbuf;
   char host[NI_MAXHOST];
   uint16_t port;
 
-  auto optid = option_lookup_token(opt.c_str(), opt.size());
-
   switch (optid) {
   case SHRPX_OPTID_BACKEND: {
+    auto &downstreamconf = *config->conn.downstream;
     auto addr_end = std::find(std::begin(optarg), std::end(optarg), ';');
 
     DownstreamAddrConfig addr{};
     if (util::istarts_with(optarg, SHRPX_UNIX_PATH_PREFIX)) {
       auto path = std::begin(optarg) + SHRPX_UNIX_PATH_PREFIX.size();
-      addr.host = ImmutableString(path, addr_end);
+      addr.host =
+          make_string_ref(downstreamconf.balloc, StringRef{path, addr_end});
       addr.host_unix = true;
     } else {
       if (split_host_port(host, sizeof(host), &port,
@@ -1794,7 +2035,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
         return -1;
       }
 
-      addr.host = ImmutableString(host);
+      addr.host = make_string_ref(downstreamconf.balloc, StringRef{host});
       addr.port = port;
     }
 
@@ -1804,7 +2045,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     auto params =
         mapping_end == std::end(optarg) ? mapping_end : mapping_end + 1;
 
-    if (parse_mapping(addr, StringRef{mapping, mapping_end},
+    if (parse_mapping(config, addr, StringRef{mapping, mapping_end},
                       StringRef{params, std::end(optarg)}) != 0) {
       return -1;
     }
@@ -1812,7 +2053,8 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   }
   case SHRPX_OPTID_FRONTEND: {
-    auto &listenerconf = mod_config()->conn.listener;
+    auto &listenerconf = config->conn.listener;
+    auto &apiconf = config->api;
 
     auto addr_end = std::find(std::begin(optarg), std::end(optarg), ';');
     auto src_params = StringRef{addr_end, std::end(optarg)};
@@ -1827,10 +2069,15 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     UpstreamAddr addr{};
     addr.fd = -1;
     addr.tls = params.tls;
+    addr.alt_mode = params.alt_mode;
+
+    if (addr.alt_mode == ALTMODE_API) {
+      apiconf.enabled = true;
+    }
 
     if (util::istarts_with(optarg, SHRPX_UNIX_PATH_PREFIX)) {
       auto path = std::begin(optarg) + SHRPX_UNIX_PATH_PREFIX.size();
-      addr.host = ImmutableString{path, addr_end};
+      addr.host = make_string_ref(config->balloc, StringRef{path, addr_end});
       addr.host_unix = true;
 
       listenerconf.addrs.push_back(std::move(addr));
@@ -1843,7 +2090,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    addr.host = ImmutableString(host);
+    addr.host = make_string_ref(config->balloc, StringRef{host});
     addr.port = port;
 
     if (util::numeric_host(host, AF_INET)) {
@@ -1870,8 +2117,8 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
 #ifdef NOTHREADS
     LOG(WARN) << "Threading disabled at build time, no threads created.";
     return 0;
-#else // !NOTHREADS
-    return parse_uint(&mod_config()->num_worker, opt, optarg);
+#else  // !NOTHREADS
+    return parse_uint(&config->num_worker, opt, optarg);
 #endif // !NOTHREADS
   case SHRPX_OPTID_HTTP2_MAX_CONCURRENT_STREAMS: {
     LOG(WARN) << opt << ": deprecated. Use "
@@ -1881,7 +2128,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     if (parse_uint(&n, opt, optarg) != 0) {
       return -1;
     }
-    auto &http2conf = mod_config()->http2;
+    auto &http2conf = config->http2;
     http2conf.upstream.max_concurrent_streams = n;
     http2conf.downstream.max_concurrent_streams = n;
 
@@ -1895,11 +2142,11 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
 
     return 0;
   case SHRPX_OPTID_DAEMON:
-    mod_config()->daemon = util::strieq_l("yes", optarg);
+    config->daemon = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_HTTP2_PROXY:
-    mod_config()->http2_proxy = util::strieq_l("yes", optarg);
+    config->http2_proxy = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_HTTP2_BRIDGE:
@@ -1913,58 +2160,53 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
            "and backend=<addr>,<port>;;proto=h2;tls";
     return -1;
   case SHRPX_OPTID_ADD_X_FORWARDED_FOR:
-    mod_config()->http.xff.add = util::strieq_l("yes", optarg);
+    config->http.xff.add = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_STRIP_INCOMING_X_FORWARDED_FOR:
-    mod_config()->http.xff.strip_incoming = util::strieq_l("yes", optarg);
+    config->http.xff.strip_incoming = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_NO_VIA:
-    mod_config()->http.no_via = util::strieq_l("yes", optarg);
+    config->http.no_via = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_FRONTEND_HTTP2_READ_TIMEOUT:
-    return parse_duration(&mod_config()->conn.upstream.timeout.http2_read, opt,
+    return parse_duration(&config->conn.upstream.timeout.http2_read, opt,
                           optarg);
   case SHRPX_OPTID_FRONTEND_READ_TIMEOUT:
-    return parse_duration(&mod_config()->conn.upstream.timeout.read, opt,
-                          optarg);
+    return parse_duration(&config->conn.upstream.timeout.read, opt, optarg);
   case SHRPX_OPTID_FRONTEND_WRITE_TIMEOUT:
-    return parse_duration(&mod_config()->conn.upstream.timeout.write, opt,
-                          optarg);
+    return parse_duration(&config->conn.upstream.timeout.write, opt, optarg);
   case SHRPX_OPTID_BACKEND_READ_TIMEOUT:
-    return parse_duration(&mod_config()->conn.downstream.timeout.read, opt,
-                          optarg);
+    return parse_duration(&config->conn.downstream->timeout.read, opt, optarg);
   case SHRPX_OPTID_BACKEND_WRITE_TIMEOUT:
-    return parse_duration(&mod_config()->conn.downstream.timeout.write, opt,
+    return parse_duration(&config->conn.downstream->timeout.write, opt, optarg);
+  case SHRPX_OPTID_BACKEND_CONNECT_TIMEOUT:
+    return parse_duration(&config->conn.downstream->timeout.connect, opt,
                           optarg);
   case SHRPX_OPTID_STREAM_READ_TIMEOUT:
-    return parse_duration(&mod_config()->http2.timeout.stream_read, opt,
-                          optarg);
+    return parse_duration(&config->http2.timeout.stream_read, opt, optarg);
   case SHRPX_OPTID_STREAM_WRITE_TIMEOUT:
-    return parse_duration(&mod_config()->http2.timeout.stream_write, opt,
-                          optarg);
+    return parse_duration(&config->http2.timeout.stream_write, opt, optarg);
   case SHRPX_OPTID_ACCESSLOG_FILE:
-    mod_config()->logging.access.file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->logging.access.file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_ACCESSLOG_SYSLOG:
-    mod_config()->logging.access.syslog = util::strieq_l("yes", optarg);
+    config->logging.access.syslog = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_ACCESSLOG_FORMAT:
-    mod_config()->logging.access.format = parse_log_format(optarg);
+    config->logging.access.format = parse_log_format(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_ERRORLOG_FILE:
-    mod_config()->logging.error.file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->logging.error.file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_ERRORLOG_SYSLOG:
-    mod_config()->logging.error.syslog = util::strieq_l("yes", optarg);
+    config->logging.error.syslog = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_FASTOPEN: {
@@ -1978,21 +2220,25 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    mod_config()->conn.listener.fastopen = n;
+    config->conn.listener.fastopen = n;
 
     return 0;
   }
   case SHRPX_OPTID_BACKEND_KEEP_ALIVE_TIMEOUT:
-    return parse_duration(&mod_config()->conn.downstream.timeout.idle_read, opt,
+    return parse_duration(&config->conn.downstream->timeout.idle_read, opt,
                           optarg);
   case SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS:
   case SHRPX_OPTID_BACKEND_HTTP2_WINDOW_BITS: {
-    size_t *resp;
+    LOG(WARN) << opt << ": deprecated.  Use "
+              << (optid == SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS
+                      ? SHRPX_OPT_FRONTEND_HTTP2_WINDOW_SIZE
+                      : SHRPX_OPT_BACKEND_HTTP2_WINDOW_SIZE);
+    int32_t *resp;
 
     if (optid == SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS) {
-      resp = &mod_config()->http2.upstream.window_bits;
+      resp = &config->http2.upstream.window_size;
     } else {
-      resp = &mod_config()->http2.downstream.window_bits;
+      resp = &config->http2.downstream.window_size;
     }
 
     errno = 0;
@@ -2009,18 +2255,25 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    *resp = n;
+    // Make 16 bits to the HTTP/2 default 64KiB - 1.  This is the same
+    // behaviour of previous code.  For SPDY, we adjust this value in
+    // SpdyUpstream to look like the SPDY default.
+    *resp = (1 << n) - 1;
 
     return 0;
   }
   case SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS:
   case SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_BITS: {
-    size_t *resp;
+    LOG(WARN) << opt << ": deprecated.  Use "
+              << (optid == SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS
+                      ? SHRPX_OPT_FRONTEND_HTTP2_CONNECTION_WINDOW_SIZE
+                      : SHRPX_OPT_BACKEND_HTTP2_CONNECTION_WINDOW_SIZE);
+    int32_t *resp;
 
     if (optid == SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS) {
-      resp = &mod_config()->http2.upstream.connection_window_bits;
+      resp = &config->http2.upstream.connection_window_size;
     } else {
-      resp = &mod_config()->http2.downstream.connection_window_bits;
+      resp = &config->http2.downstream.connection_window_size;
     }
 
     errno = 0;
@@ -2037,7 +2290,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    *resp = n;
+    *resp = (1 << n) - 1;
 
     return 0;
   }
@@ -2047,33 +2300,36 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   case SHRPX_OPTID_BACKEND_NO_TLS:
     LOG(WARN) << opt << ": deprecated.  backend connection is not encrypted by "
-                        "default.  See also " << SHRPX_OPT_BACKEND_TLS;
+                        "default.  See also "
+              << SHRPX_OPT_BACKEND_TLS;
     return 0;
   case SHRPX_OPTID_BACKEND_TLS_SNI_FIELD:
-    mod_config()->tls.backend_sni_name = optarg.str();
+    LOG(WARN) << opt << ": deprecated.  Use sni keyword in --backend option.  "
+                        "For now, all sni values of all backends are "
+                        "overridden by the given value "
+              << optarg;
+    config->tls.backend_sni_name = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_PID_FILE:
-    mod_config()->pid_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->pid_file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_USER: {
     auto pwd = getpwnam(optarg.c_str());
     if (!pwd) {
       LOG(ERROR) << opt << ": failed to get uid from " << optarg << ": "
-                 << strerror(errno);
+                 << xsi_strerror(errno, errbuf.data(), errbuf.size());
       return -1;
     }
-    mod_config()->user = pwd->pw_name;
-    mod_config()->uid = pwd->pw_uid;
-    mod_config()->gid = pwd->pw_gid;
+    config->user = make_string_ref(config->balloc, StringRef{pwd->pw_name});
+    config->uid = pwd->pw_uid;
+    config->gid = pwd->pw_gid;
 
     return 0;
   }
   case SHRPX_OPTID_PRIVATE_KEY_FILE:
-    mod_config()->tls.private_key_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.private_key_file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_PRIVATE_KEY_PASSWD_FILE: {
@@ -2082,44 +2338,65 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       LOG(ERROR) << opt << ": Couldn't read key file's passwd from " << optarg;
       return -1;
     }
-    mod_config()->tls.private_key_passwd = passwd;
+    config->tls.private_key_passwd =
+        make_string_ref(config->balloc, StringRef{passwd});
 
     return 0;
   }
   case SHRPX_OPTID_CERTIFICATE_FILE:
-    mod_config()->tls.cert_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.cert_file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_DH_PARAM_FILE:
-    mod_config()->tls.dh_param_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.dh_param_file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_SUBCERT: {
+    auto end_keys = std::find(std::begin(optarg), std::end(optarg), ';');
+    auto src_params = StringRef{end_keys, std::end(optarg)};
+
+    SubcertParams params;
+    if (parse_subcert_params(params, src_params) != 0) {
+      return -1;
+    }
+
+    std::vector<uint8_t> sct_data;
+
+    if (!params.sct_dir.empty()) {
+      // Make sure that dir_path is NULL terminated string.
+      if (read_tls_sct_from_dir(sct_data, opt,
+                                StringRef{params.sct_dir.str()}) != 0) {
+        return -1;
+      }
+    }
+
     // Private Key file and certificate file separated by ':'.
-    auto sp = std::find(std::begin(optarg), std::end(optarg), ':');
-    if (sp == std::end(optarg)) {
-      LOG(ERROR) << opt << ": missing ':' in " << optarg;
+    auto sp = std::find(std::begin(optarg), end_keys, ':');
+    if (sp == end_keys) {
+      LOG(ERROR) << opt << ": missing ':' in "
+                 << StringRef{std::begin(optarg), end_keys};
       return -1;
     }
 
     auto private_key_file = StringRef{std::begin(optarg), sp};
 
     if (private_key_file.empty()) {
-      LOG(ERROR) << opt << ": missing private key file: " << optarg;
+      LOG(ERROR) << opt << ": missing private key file: "
+                 << StringRef{std::begin(optarg), end_keys};
       return -1;
     }
 
-    auto cert_file = StringRef{sp + 1, std::end(optarg)};
+    auto cert_file = StringRef{sp + 1, end_keys};
 
     if (cert_file.empty()) {
-      LOG(ERROR) << opt << ": missing certificate file: " << optarg;
+      LOG(ERROR) << opt << ": missing certificate file: "
+                 << StringRef{std::begin(optarg), end_keys};
       return -1;
     }
 
-    mod_config()->tls.subcerts.emplace_back(private_key_file.str(),
-                                            cert_file.str());
+    config->tls.subcerts.emplace_back(
+        make_string_ref(config->balloc, private_key_file),
+        make_string_ref(config->balloc, cert_file), std::move(sct_data));
 
     return 0;
   }
@@ -2129,7 +2406,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       LOG(ERROR) << opt << ": Unknown syslog facility: " << optarg;
       return -1;
     }
-    mod_config()->logging.syslog_facility = facility;
+    config->logging.syslog_facility = facility;
 
     return 0;
   }
@@ -2145,13 +2422,12 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    mod_config()->conn.listener.backlog = n;
+    config->conn.listener.backlog = n;
 
     return 0;
   }
   case SHRPX_OPTID_CIPHERS:
-    mod_config()->tls.ciphers =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.ciphers = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_CLIENT:
@@ -2159,30 +2435,29 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
                          "backend=<addr>,<port>;;proto=h2;tls";
     return -1;
   case SHRPX_OPTID_INSECURE:
-    mod_config()->tls.insecure = util::strieq_l("yes", optarg);
+    config->tls.insecure = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_CACERT:
-    mod_config()->tls.cacert =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.cacert = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_BACKEND_IPV4:
     LOG(WARN) << opt
               << ": deprecated.  Use backend-address-family=IPv4 instead.";
 
-    mod_config()->conn.downstream.family = AF_INET;
+    config->conn.downstream->family = AF_INET;
 
     return 0;
   case SHRPX_OPTID_BACKEND_IPV6:
     LOG(WARN) << opt
               << ": deprecated.  Use backend-address-family=IPv6 instead.";
 
-    mod_config()->conn.downstream.family = AF_INET6;
+    config->conn.downstream->family = AF_INET6;
 
     return 0;
   case SHRPX_OPTID_BACKEND_HTTP_PROXY_URI: {
-    auto &proxy = mod_config()->downstream_http_proxy;
+    auto &proxy = config->downstream_http_proxy;
     // Reset here so that multiple option occurrence does not merge
     // the results.
     proxy = {};
@@ -2195,11 +2470,12 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
         // Surprisingly, u.field_set & UF_USERINFO is nonzero even if
         // userinfo component is empty string.
         if (!uf.empty()) {
-          proxy.userinfo = util::percent_decode(std::begin(uf), std::end(uf));
+          proxy.userinfo = util::percent_decode(config->balloc, uf);
         }
       }
       if (u.field_set & UF_HOST) {
-        http2::copy_url_component(proxy.host, &u, UF_HOST, optarg.c_str());
+        proxy.host = make_string_ref(
+            config->balloc, util::get_uri_field(optarg.c_str(), u, UF_HOST));
       } else {
         LOG(ERROR) << opt << ": no hostname specified";
         return -1;
@@ -2218,17 +2494,17 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   }
   case SHRPX_OPTID_READ_RATE:
-    return parse_uint_with_unit(
-        &mod_config()->conn.upstream.ratelimit.read.rate, opt, optarg);
+    return parse_uint_with_unit(&config->conn.upstream.ratelimit.read.rate, opt,
+                                optarg);
   case SHRPX_OPTID_READ_BURST:
-    return parse_uint_with_unit(
-        &mod_config()->conn.upstream.ratelimit.read.burst, opt, optarg);
+    return parse_uint_with_unit(&config->conn.upstream.ratelimit.read.burst,
+                                opt, optarg);
   case SHRPX_OPTID_WRITE_RATE:
-    return parse_uint_with_unit(
-        &mod_config()->conn.upstream.ratelimit.write.rate, opt, optarg);
+    return parse_uint_with_unit(&config->conn.upstream.ratelimit.write.rate,
+                                opt, optarg);
   case SHRPX_OPTID_WRITE_BURST:
-    return parse_uint_with_unit(
-        &mod_config()->conn.upstream.ratelimit.write.burst, opt, optarg);
+    return parse_uint_with_unit(&config->conn.upstream.ratelimit.write.burst,
+                                opt, optarg);
   case SHRPX_OPTID_WORKER_READ_RATE:
     LOG(WARN) << opt << ": not implemented yet";
     return 0;
@@ -2241,54 +2517,61 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
   case SHRPX_OPTID_WORKER_WRITE_BURST:
     LOG(WARN) << opt << ": not implemented yet";
     return 0;
-  case SHRPX_OPTID_NPN_LIST:
-    mod_config()->tls.npn_list = util::parse_config_str_list(optarg);
+  case SHRPX_OPTID_NPN_LIST: {
+    auto list = util::split_str(optarg, ',');
+    config->tls.npn_list.resize(list.size());
+    for (size_t i = 0; i < list.size(); ++i) {
+      config->tls.npn_list[i] = make_string_ref(config->balloc, list[i]);
+    }
 
     return 0;
-  case SHRPX_OPTID_TLS_PROTO_LIST:
-    mod_config()->tls.tls_proto_list = util::parse_config_str_list(optarg);
+  }
+  case SHRPX_OPTID_TLS_PROTO_LIST: {
+    auto list = util::split_str(optarg, ',');
+    config->tls.tls_proto_list.resize(list.size());
+    for (size_t i = 0; i < list.size(); ++i) {
+      config->tls.tls_proto_list[i] = make_string_ref(config->balloc, list[i]);
+    }
 
     return 0;
+  }
   case SHRPX_OPTID_VERIFY_CLIENT:
-    mod_config()->tls.client_verify.enabled = util::strieq_l("yes", optarg);
+    config->tls.client_verify.enabled = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_VERIFY_CLIENT_CACERT:
-    mod_config()->tls.client_verify.cacert =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.client_verify.cacert = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_CLIENT_PRIVATE_KEY_FILE:
-    mod_config()->tls.client.private_key_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.client.private_key_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_CLIENT_CERT_FILE:
-    mod_config()->tls.client.cert_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.client.cert_file = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_FRONTEND_HTTP2_DUMP_REQUEST_HEADER:
-    mod_config()->http2.upstream.debug.dump.request_header_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->http2.upstream.debug.dump.request_header_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER:
-    mod_config()->http2.upstream.debug.dump.response_header_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->http2.upstream.debug.dump.response_header_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_HTTP2_NO_COOKIE_CRUMBLING:
-    mod_config()->http2.no_cookie_crumbling = util::strieq_l("yes", optarg);
+    config->http2.no_cookie_crumbling = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_FRONTEND_FRAME_DEBUG:
-    mod_config()->http2.upstream.debug.frame_debug =
-        util::strieq_l("yes", optarg);
+    config->http2.upstream.debug.frame_debug = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_PADDING:
-    return parse_uint(&mod_config()->padding, opt, optarg);
+    return parse_uint(&config->padding, opt, optarg);
   case SHRPX_OPTID_ALTSVC: {
     auto tokens = util::split_str(optarg, ',');
 
@@ -2318,42 +2601,41 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
 
     AltSvc altsvc{};
 
-    altsvc.protocol_id = tokens[0].str();
+    altsvc.protocol_id = make_string_ref(config->balloc, tokens[0]);
 
     altsvc.port = port;
-    altsvc.service = tokens[1].str();
+    altsvc.service = make_string_ref(config->balloc, tokens[1]);
 
     if (tokens.size() > 2) {
-      altsvc.host = tokens[2].str();
+      altsvc.host = make_string_ref(config->balloc, tokens[2]);
 
       if (tokens.size() > 3) {
-        altsvc.origin = tokens[3].str();
+        altsvc.origin = make_string_ref(config->balloc, tokens[3]);
       }
     }
 
-    mod_config()->http.altsvcs.push_back(std::move(altsvc));
+    config->http.altsvcs.push_back(std::move(altsvc));
 
     return 0;
   }
   case SHRPX_OPTID_ADD_REQUEST_HEADER:
   case SHRPX_OPTID_ADD_RESPONSE_HEADER: {
-    auto p = parse_header(optarg);
+    auto p = parse_header(config->balloc, optarg);
     if (p.name.empty()) {
       LOG(ERROR) << opt << ": invalid header field: " << optarg;
       return -1;
     }
     if (optid == SHRPX_OPTID_ADD_REQUEST_HEADER) {
-      mod_config()->http.add_request_headers.push_back(std::move(p));
+      config->http.add_request_headers.push_back(std::move(p));
     } else {
-      mod_config()->http.add_response_headers.push_back(std::move(p));
+      config->http.add_response_headers.push_back(std::move(p));
     }
     return 0;
   }
   case SHRPX_OPTID_WORKER_FRONTEND_CONNECTIONS:
-    return parse_uint(&mod_config()->conn.upstream.worker_connections, opt,
-                      optarg);
+    return parse_uint(&config->conn.upstream.worker_connections, opt, optarg);
   case SHRPX_OPTID_NO_LOCATION_REWRITE:
-    mod_config()->http.no_location_rewrite = util::strieq_l("yes", optarg);
+    config->http.no_location_rewrite = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_NO_HOST_REWRITE:
@@ -2380,7 +2662,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    mod_config()->conn.downstream.connections_per_host = n;
+    config->conn.downstream->connections_per_host = n;
 
     return 0;
   }
@@ -2389,13 +2671,13 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
               << SHRPX_OPT_BACKEND_CONNECTIONS_PER_FRONTEND << " instead.";
   // fall through
   case SHRPX_OPTID_BACKEND_CONNECTIONS_PER_FRONTEND:
-    return parse_uint(&mod_config()->conn.downstream.connections_per_frontend,
-                      opt, optarg);
+    return parse_uint(&config->conn.downstream->connections_per_frontend, opt,
+                      optarg);
   case SHRPX_OPTID_LISTENER_DISABLE_TIMEOUT:
-    return parse_duration(&mod_config()->conn.listener.timeout.sleep, opt,
-                          optarg);
+    return parse_duration(&config->conn.listener.timeout.sleep, opt, optarg);
   case SHRPX_OPTID_TLS_TICKET_KEY_FILE:
-    mod_config()->tls.ticket.files.push_back(optarg.str());
+    config->tls.ticket.files.emplace_back(
+        make_string_ref(config->balloc, optarg));
     return 0;
   case SHRPX_OPTID_RLIMIT_NOFILE: {
     int n;
@@ -2410,7 +2692,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    mod_config()->rlimit_nofile = n;
+    config->rlimit_nofile = n;
 
     return 0;
   }
@@ -2428,30 +2710,30 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     }
 
     if (optid == SHRPX_OPTID_BACKEND_REQUEST_BUFFER) {
-      mod_config()->conn.downstream.request_buffer_size = n;
+      config->conn.downstream->request_buffer_size = n;
     } else {
-      mod_config()->conn.downstream.response_buffer_size = n;
+      config->conn.downstream->response_buffer_size = n;
     }
 
     return 0;
   }
 
   case SHRPX_OPTID_NO_SERVER_PUSH:
-    mod_config()->http2.no_server_push = util::strieq_l("yes", optarg);
+    config->http2.no_server_push = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_BACKEND_HTTP2_CONNECTIONS_PER_WORKER:
     LOG(WARN) << opt << ": deprecated.";
     return 0;
   case SHRPX_OPTID_FETCH_OCSP_RESPONSE_FILE:
-    mod_config()->tls.ocsp.fetch_ocsp_response_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.ocsp.fetch_ocsp_response_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_OCSP_UPDATE_INTERVAL:
-    return parse_duration(&mod_config()->tls.ocsp.update_interval, opt, optarg);
+    return parse_duration(&config->tls.ocsp.update_interval, opt, optarg);
   case SHRPX_OPTID_NO_OCSP:
-    mod_config()->tls.ocsp.disabled = util::strieq_l("yes", optarg);
+    config->tls.ocsp.disabled = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_HEADER_FIELD_BUFFER:
@@ -2459,20 +2741,18 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
               << ": deprecated.  Use request-header-field-buffer instead.";
   // fall through
   case SHRPX_OPTID_REQUEST_HEADER_FIELD_BUFFER:
-    return parse_uint_with_unit(&mod_config()->http.request_header_field_buffer,
-                                opt, optarg);
+    return parse_uint_with_unit(&config->http.request_header_field_buffer, opt,
+                                optarg);
   case SHRPX_OPTID_MAX_HEADER_FIELDS:
     LOG(WARN) << opt << ": deprecated.  Use max-request-header-fields instead.";
   // fall through
   case SHRPX_OPTID_MAX_REQUEST_HEADER_FIELDS:
-    return parse_uint(&mod_config()->http.max_request_header_fields, opt,
-                      optarg);
+    return parse_uint(&config->http.max_request_header_fields, opt, optarg);
   case SHRPX_OPTID_RESPONSE_HEADER_FIELD_BUFFER:
-    return parse_uint_with_unit(
-        &mod_config()->http.response_header_field_buffer, opt, optarg);
+    return parse_uint_with_unit(&config->http.response_header_field_buffer, opt,
+                                optarg);
   case SHRPX_OPTID_MAX_RESPONSE_HEADER_FIELDS:
-    return parse_uint(&mod_config()->http.max_response_header_fields, opt,
-                      optarg);
+    return parse_uint(&config->http.max_response_header_fields, opt, optarg);
   case SHRPX_OPTID_INCLUDE: {
     if (included_set.count(optarg)) {
       LOG(ERROR) << opt << ": " << optarg << " has already been included";
@@ -2480,7 +2760,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     }
 
     included_set.insert(optarg);
-    auto rv = load_config(optarg.c_str(), included_set);
+    auto rv = load_config(config, optarg.c_str(), included_set);
     included_set.erase(optarg);
 
     if (rv != 0) {
@@ -2491,19 +2771,19 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
   }
   case SHRPX_OPTID_TLS_TICKET_KEY_CIPHER:
     if (util::strieq_l("aes-128-cbc", optarg)) {
-      mod_config()->tls.ticket.cipher = EVP_aes_128_cbc();
+      config->tls.ticket.cipher = EVP_aes_128_cbc();
     } else if (util::strieq_l("aes-256-cbc", optarg)) {
-      mod_config()->tls.ticket.cipher = EVP_aes_256_cbc();
+      config->tls.ticket.cipher = EVP_aes_256_cbc();
     } else {
       LOG(ERROR) << opt
                  << ": unsupported cipher for ticket encryption: " << optarg;
       return -1;
     }
-    mod_config()->tls.ticket.cipher_given = true;
+    config->tls.ticket.cipher_given = true;
 
     return 0;
   case SHRPX_OPTID_HOST_REWRITE:
-    mod_config()->http.no_host_rewrite = !util::strieq_l("yes", optarg);
+    config->http.no_host_rewrite = !util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED:
@@ -2524,15 +2804,15 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
 
     switch (optid) {
     case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED: {
-      auto &memcachedconf = mod_config()->tls.session_cache.memcached;
-      memcachedconf.host = host;
+      auto &memcachedconf = config->tls.session_cache.memcached;
+      memcachedconf.host = make_string_ref(config->balloc, StringRef{host});
       memcachedconf.port = port;
       memcachedconf.tls = params.tls;
       break;
     }
     case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED: {
-      auto &memcachedconf = mod_config()->tls.ticket.memcached;
-      memcachedconf.host = host;
+      auto &memcachedconf = config->tls.ticket.memcached;
+      memcachedconf.host = make_string_ref(config->balloc, StringRef{host});
       memcachedconf.port = port;
       memcachedconf.tls = params.tls;
       break;
@@ -2542,8 +2822,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   }
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_INTERVAL:
-    return parse_duration(&mod_config()->tls.ticket.memcached.interval, opt,
-                          optarg);
+    return parse_duration(&config->tls.ticket.memcached.interval, opt, optarg);
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY: {
     int n;
     if (parse_uint(&n, opt, optarg) != 0) {
@@ -2555,42 +2834,39 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    mod_config()->tls.ticket.memcached.max_retry = n;
+    config->tls.ticket.memcached.max_retry = n;
     return 0;
   }
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL:
-    return parse_uint(&mod_config()->tls.ticket.memcached.max_fail, opt,
-                      optarg);
+    return parse_uint(&config->tls.ticket.memcached.max_fail, opt, optarg);
   case SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD: {
     size_t n;
     if (parse_uint_with_unit(&n, opt, optarg) != 0) {
       return -1;
     }
 
-    mod_config()->tls.dyn_rec.warmup_threshold = n;
+    config->tls.dyn_rec.warmup_threshold = n;
 
     return 0;
   }
 
   case SHRPX_OPTID_TLS_DYN_REC_IDLE_TIMEOUT:
-    return parse_duration(&mod_config()->tls.dyn_rec.idle_timeout, opt, optarg);
+    return parse_duration(&config->tls.dyn_rec.idle_timeout, opt, optarg);
 
   case SHRPX_OPTID_MRUBY_FILE:
 #ifdef HAVE_MRUBY
-    mod_config()->mruby_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->mruby_file = make_string_ref(config->balloc, optarg);
 #else  // !HAVE_MRUBY
     LOG(WARN) << opt
               << ": ignored because mruby support is disabled at build time.";
 #endif // !HAVE_MRUBY
     return 0;
   case SHRPX_OPTID_ACCEPT_PROXY_PROTOCOL:
-    mod_config()->conn.upstream.accept_proxy_protocol =
-        util::strieq_l("yes", optarg);
+    config->conn.upstream.accept_proxy_protocol = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_ADD_FORWARDED: {
-    auto &fwdconf = mod_config()->http.forwarded;
+    auto &fwdconf = config->http.forwarded;
     fwdconf.params = FORWARDED_NONE;
     for (const auto &param : util::split_str(optarg, ',')) {
       if (util::strieq_l("by", param)) {
@@ -2618,7 +2894,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   }
   case SHRPX_OPTID_STRIP_INCOMING_FORWARDED:
-    mod_config()->http.forwarded.strip_incoming = util::strieq_l("yes", optarg);
+    config->http.forwarded.strip_incoming = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_FORWARDED_BY:
@@ -2632,15 +2908,15 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
       return -1;
     }
 
-    auto &fwdconf = mod_config()->http.forwarded;
+    auto &fwdconf = config->http.forwarded;
 
     switch (optid) {
     case SHRPX_OPTID_FORWARDED_BY:
       fwdconf.by_node_type = static_cast<shrpx_forwarded_node_type>(type);
       if (optarg[0] == '_') {
-        fwdconf.by_obfuscated = optarg.str();
+        fwdconf.by_obfuscated = make_string_ref(config->balloc, optarg);
       } else {
-        fwdconf.by_obfuscated = "";
+        fwdconf.by_obfuscated = StringRef::from_lit("");
       }
       break;
     case SHRPX_OPTID_FORWARDED_FOR:
@@ -2651,8 +2927,7 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
     return 0;
   }
   case SHRPX_OPTID_NO_HTTP2_CIPHER_BLACK_LIST:
-    mod_config()->tls.no_http2_cipher_black_list =
-        util::strieq_l("yes", optarg);
+    config->tls.no_http2_cipher_black_list = util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_BACKEND_HTTP1_TLS:
@@ -2665,13 +2940,13 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
               << SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED;
     return 0;
   case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE:
-    mod_config()->tls.session_cache.memcached.cert_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.session_cache.memcached.cert_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE:
-    mod_config()->tls.session_cache.memcached.private_key_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.session_cache.memcached.private_key_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS:
@@ -2679,32 +2954,142 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
               << SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED;
     return 0;
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE:
-    mod_config()->tls.ticket.memcached.cert_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.ticket.memcached.cert_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE:
-    mod_config()->tls.ticket.memcached.private_key_file =
-        ImmutableString{std::begin(optarg), std::end(optarg)};
+    config->tls.ticket.memcached.private_key_file =
+        make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY:
-    return parse_address_family(&mod_config()->tls.ticket.memcached.family, opt,
+    return parse_address_family(&config->tls.ticket.memcached.family, opt,
                                 optarg);
   case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY:
-    return parse_address_family(
-        &mod_config()->tls.session_cache.memcached.family, opt, optarg);
+    return parse_address_family(&config->tls.session_cache.memcached.family,
+                                opt, optarg);
   case SHRPX_OPTID_BACKEND_ADDRESS_FAMILY:
-    return parse_address_family(&mod_config()->conn.downstream.family, opt,
-                                optarg);
+    return parse_address_family(&config->conn.downstream->family, opt, optarg);
   case SHRPX_OPTID_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS:
-    return parse_uint(&mod_config()->http2.upstream.max_concurrent_streams, opt,
+    return parse_uint(&config->http2.upstream.max_concurrent_streams, opt,
                       optarg);
   case SHRPX_OPTID_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS:
-    return parse_uint(&mod_config()->http2.downstream.max_concurrent_streams,
-                      opt, optarg);
+    return parse_uint(&config->http2.downstream.max_concurrent_streams, opt,
+                      optarg);
   case SHRPX_OPTID_ERROR_PAGE:
-    return parse_error_page(mod_config()->http.error_pages, opt, optarg);
+    return parse_error_page(config->http.error_pages, opt, optarg);
+  case SHRPX_OPTID_NO_KQUEUE:
+    if ((ev_supported_backends() & EVBACKEND_KQUEUE) == 0) {
+      LOG(WARN) << opt << ": kqueue is not supported on this platform";
+      return 0;
+    }
+
+    config->ev_loop_flags = ev_recommended_backends() & ~EVBACKEND_KQUEUE;
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_SETTINGS_TIMEOUT:
+    return parse_duration(&config->http2.upstream.timeout.settings, opt,
+                          optarg);
+  case SHRPX_OPTID_BACKEND_HTTP2_SETTINGS_TIMEOUT:
+    return parse_duration(&config->http2.downstream.timeout.settings, opt,
+                          optarg);
+  case SHRPX_OPTID_API_MAX_REQUEST_BODY:
+    return parse_uint_with_unit(&config->api.max_request_body, opt, optarg);
+  case SHRPX_OPTID_BACKEND_MAX_BACKOFF:
+    return parse_duration(&config->conn.downstream->timeout.max_backoff, opt,
+                          optarg);
+  case SHRPX_OPTID_SERVER_NAME:
+    config->http.server_name = make_string_ref(config->balloc, optarg);
+
+    return 0;
+  case SHRPX_OPTID_NO_SERVER_REWRITE:
+    config->http.no_server_rewrite = util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WRITE_BUFFER_SIZE:
+    config->http2.upstream.optimize_write_buffer_size =
+        util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WINDOW_SIZE:
+    config->http2.upstream.optimize_window_size = util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_SIZE:
+    if (parse_uint_with_unit(&config->http2.upstream.window_size, opt,
+                             optarg) != 0) {
+      return -1;
+    }
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_SIZE:
+    if (parse_uint_with_unit(&config->http2.upstream.connection_window_size,
+                             opt, optarg) != 0) {
+      return -1;
+    }
+
+    return 0;
+  case SHRPX_OPTID_BACKEND_HTTP2_WINDOW_SIZE:
+    if (parse_uint_with_unit(&config->http2.downstream.window_size, opt,
+                             optarg) != 0) {
+      return -1;
+    }
+
+    return 0;
+  case SHRPX_OPTID_BACKEND_HTTP2_CONNECTION_WINDOW_SIZE:
+    if (parse_uint_with_unit(&config->http2.downstream.connection_window_size,
+                             opt, optarg) != 0) {
+      return -1;
+    }
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE:
+    if (parse_uint_with_unit(&config->http2.upstream.encoder_dynamic_table_size,
+                             opt, optarg) != 0) {
+      return -1;
+    }
+
+    nghttp2_option_set_max_deflate_dynamic_table_size(
+        config->http2.upstream.option,
+        config->http2.upstream.encoder_dynamic_table_size);
+    nghttp2_option_set_max_deflate_dynamic_table_size(
+        config->http2.upstream.alt_mode_option,
+        config->http2.upstream.encoder_dynamic_table_size);
+
+    return 0;
+  case SHRPX_OPTID_FRONTEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE:
+    return parse_uint_with_unit(
+        &config->http2.upstream.decoder_dynamic_table_size, opt, optarg);
+  case SHRPX_OPTID_BACKEND_HTTP2_ENCODER_DYNAMIC_TABLE_SIZE:
+    if (parse_uint_with_unit(
+            &config->http2.downstream.encoder_dynamic_table_size, opt,
+            optarg) != 0) {
+      return -1;
+    }
+
+    nghttp2_option_set_max_deflate_dynamic_table_size(
+        config->http2.downstream.option,
+        config->http2.downstream.encoder_dynamic_table_size);
+
+    return 0;
+  case SHRPX_OPTID_BACKEND_HTTP2_DECODER_DYNAMIC_TABLE_SIZE:
+    return parse_uint_with_unit(
+        &config->http2.downstream.decoder_dynamic_table_size, opt, optarg);
+  case SHRPX_OPTID_ECDH_CURVES:
+#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
+    config->tls.ecdh_curves = make_string_ref(config->balloc, optarg);
+#else  // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
+    LOG(WARN) << opt << ": This option requires OpenSSL >= 1.0.2";
+#endif // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
+    return 0;
+  case SHRPX_OPTID_TLS_SCT_DIR:
+#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
+    return read_tls_sct_from_dir(config->tls.sct_data, opt, optarg);
+#else  // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
+    LOG(WARN) << opt << ": This option requires OpenSSL >= 1.0.2";
+    return 0;
+#endif // !(!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
   case SHRPX_OPTID_CONF:
     LOG(WARN) << "conf: ignored";
 
@@ -2716,7 +3101,8 @@ int parse_config(const StringRef &opt, const StringRef &optarg,
   return -1;
 }
 
-int load_config(const char *filename, std::set<StringRef> &include_set) {
+int load_config(Config *config, const char *filename,
+                std::set<StringRef> &include_set) {
   std::ifstream in(filename, std::ios::binary);
   if (!in) {
     LOG(ERROR) << "Could not open config file " << filename;
@@ -2737,7 +3123,7 @@ int load_config(const char *filename, std::set<StringRef> &include_set) {
     }
     *eq = '\0';
 
-    if (parse_config(StringRef{std::begin(line), eq},
+    if (parse_config(config, StringRef{std::begin(line), eq},
                      StringRef{eq + 1, std::end(line)}, include_set) != 0) {
       return -1;
     }
@@ -2896,6 +3282,244 @@ StringRef strproto(shrpx_proto proto) {
 
   // gcc needs this.
   assert(0);
+}
+
+namespace {
+// Consistent hashing method described in
+// https://github.com/RJ/ketama.  Generate 160 32-bit hashes per |s|,
+// which is usually backend address.  The each hash is associated to
+// index of backend address.  When all hashes for every backend
+// address are calculated, sort it in ascending order of hash.  To
+// choose the index, compute 32-bit hash based on client IP address,
+// and do lower bound search in the array. The returned index is the
+// backend to use.
+int compute_affinity_hash(std::vector<AffinityHash> &res, size_t idx,
+                          const StringRef &s) {
+  int rv;
+  std::array<uint8_t, 32> buf;
+
+  for (auto i = 0; i < 20; ++i) {
+    auto t = s.str();
+    t += i;
+
+    rv = util::sha256(buf.data(), StringRef{t});
+    if (rv != 0) {
+      return -1;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+      auto h = (static_cast<uint32_t>(buf[4 * i]) << 24) |
+               (static_cast<uint32_t>(buf[4 * i + 1]) << 16) |
+               (static_cast<uint32_t>(buf[4 * i + 2]) << 8) |
+               static_cast<uint32_t>(buf[4 * i + 3]);
+
+      res.emplace_back(idx, h);
+    }
+  }
+
+  return 0;
+}
+} // namespace
+
+// Configures the following member in |config|:
+// conn.downstream_router, conn.downstream.addr_groups,
+// conn.downstream.addr_group_catch_all.
+int configure_downstream_group(Config *config, bool http2_proxy,
+                               bool numeric_addr_only,
+                               const TLSConfig &tlsconf) {
+  int rv;
+
+  auto &downstreamconf = *config->conn.downstream;
+  auto &addr_groups = downstreamconf.addr_groups;
+  auto &routerconf = downstreamconf.router;
+  auto &router = routerconf.router;
+
+  if (addr_groups.empty()) {
+    DownstreamAddrConfig addr{};
+    addr.host = StringRef::from_lit(DEFAULT_DOWNSTREAM_HOST);
+    addr.port = DEFAULT_DOWNSTREAM_PORT;
+    addr.proto = PROTO_HTTP1;
+
+    DownstreamAddrGroupConfig g(StringRef::from_lit("/"));
+    g.addrs.push_back(std::move(addr));
+    router.add_route(g.pattern, addr_groups.size());
+    addr_groups.push_back(std::move(g));
+  } else if (http2_proxy) {
+    // We don't support host mapping in these cases.  Move all
+    // non-catch-all patterns to catch-all pattern.
+    DownstreamAddrGroupConfig catch_all(StringRef::from_lit("/"));
+    for (auto &g : addr_groups) {
+      std::move(std::begin(g.addrs), std::end(g.addrs),
+                std::back_inserter(catch_all.addrs));
+    }
+    std::vector<DownstreamAddrGroupConfig>().swap(addr_groups);
+    // maybe not necessary?
+    routerconf = RouterConfig{};
+    router.add_route(catch_all.pattern, addr_groups.size());
+    addr_groups.push_back(std::move(catch_all));
+  }
+
+  // backward compatibility: override all SNI fields with the option
+  // value --backend-tls-sni-field
+  if (!tlsconf.backend_sni_name.empty()) {
+    auto &sni = tlsconf.backend_sni_name;
+    for (auto &addr_group : addr_groups) {
+      for (auto &addr : addr_group.addrs) {
+        addr.sni = StringRef{sni};
+      }
+    }
+  }
+
+  if (LOG_ENABLED(INFO)) {
+    LOG(INFO) << "Resolving backend address";
+  }
+
+  ssize_t catch_all_group = -1;
+  for (size_t i = 0; i < addr_groups.size(); ++i) {
+    auto &g = addr_groups[i];
+    if (g.pattern == StringRef::from_lit("/")) {
+      catch_all_group = i;
+    }
+    if (LOG_ENABLED(INFO)) {
+      LOG(INFO) << "Host-path pattern: group " << i << ": '" << g.pattern
+                << "'";
+      for (auto &addr : g.addrs) {
+        LOG(INFO) << "group " << i << " -> " << addr.host.c_str()
+                  << (addr.host_unix ? "" : ":" + util::utos(addr.port))
+                  << ", proto=" << strproto(addr.proto)
+                  << (addr.tls ? ", tls" : "");
+      }
+    }
+  }
+
+  if (catch_all_group == -1) {
+    LOG(FATAL) << "backend: No catch-all backend address is configured";
+    return -1;
+  }
+
+  downstreamconf.addr_group_catch_all = catch_all_group;
+
+  if (LOG_ENABLED(INFO)) {
+    LOG(INFO) << "Catch-all pattern is group " << catch_all_group;
+  }
+
+  auto resolve_flags = numeric_addr_only ? AI_NUMERICHOST | AI_NUMERICSERV : 0;
+
+  for (auto &g : addr_groups) {
+    for (auto &addr : g.addrs) {
+
+      if (addr.host_unix) {
+        // for AF_UNIX socket, we use "localhost" as host for backend
+        // hostport.  This is used as Host header field to backend and
+        // not going to be passed to any syscalls.
+        addr.hostport = StringRef::from_lit("localhost");
+
+        auto path = addr.host.c_str();
+        auto pathlen = addr.host.size();
+
+        if (pathlen + 1 > sizeof(addr.addr.su.un.sun_path)) {
+          LOG(FATAL) << "UNIX domain socket path " << path << " is too long > "
+                     << sizeof(addr.addr.su.un.sun_path);
+          return -1;
+        }
+
+        if (LOG_ENABLED(INFO)) {
+          LOG(INFO) << "Use UNIX domain socket path " << path
+                    << " for backend connection";
+        }
+
+        addr.addr.su.un.sun_family = AF_UNIX;
+        // copy path including terminal NULL
+        std::copy_n(path, pathlen + 1, addr.addr.su.un.sun_path);
+        addr.addr.len = sizeof(addr.addr.su.un);
+
+        continue;
+      }
+
+      addr.hostport =
+          util::make_http_hostport(downstreamconf.balloc, addr.host, addr.port);
+
+      auto hostport =
+          util::make_hostport(downstreamconf.balloc, addr.host, addr.port);
+
+      if (resolve_hostname(&addr.addr, addr.host.c_str(), addr.port,
+                           downstreamconf.family, resolve_flags) == -1) {
+        LOG(FATAL) << "Resolving backend address failed: " << hostport;
+        return -1;
+      }
+
+      if (LOG_ENABLED(INFO)) {
+        LOG(INFO) << "Resolved backend address: " << hostport << " -> "
+                  << util::to_numeric_addr(&addr.addr);
+      }
+    }
+
+    if (g.affinity == AFFINITY_IP) {
+      size_t idx = 0;
+      for (auto &addr : g.addrs) {
+        auto p = reinterpret_cast<uint8_t *>(&addr.addr.su);
+        rv = compute_affinity_hash(g.affinity_hash, idx,
+                                   StringRef{p, addr.addr.len});
+        if (rv != 0) {
+          return -1;
+        }
+
+        ++idx;
+      }
+
+      std::sort(std::begin(g.affinity_hash), std::end(g.affinity_hash),
+                [](const AffinityHash &lhs, const AffinityHash &rhs) {
+                  return lhs.hash < rhs.hash;
+                });
+    }
+  }
+
+  return 0;
+}
+
+int resolve_hostname(Address *addr, const char *hostname, uint16_t port,
+                     int family, int additional_flags) {
+  int rv;
+
+  auto service = util::utos(port);
+
+  addrinfo hints{};
+  hints.ai_family = family;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags |= additional_flags;
+#ifdef AI_ADDRCONFIG
+  hints.ai_flags |= AI_ADDRCONFIG;
+#endif // AI_ADDRCONFIG
+  addrinfo *res;
+
+  rv = getaddrinfo(hostname, service.c_str(), &hints, &res);
+  if (rv != 0) {
+    LOG(FATAL) << "Unable to resolve address for " << hostname << ": "
+               << gai_strerror(rv);
+    return -1;
+  }
+
+  auto res_d = defer(freeaddrinfo, res);
+
+  char host[NI_MAXHOST];
+  rv = getnameinfo(res->ai_addr, res->ai_addrlen, host, sizeof(host), nullptr,
+                   0, NI_NUMERICHOST);
+  if (rv != 0) {
+    LOG(FATAL) << "Address resolution for " << hostname
+               << " failed: " << gai_strerror(rv);
+
+    return -1;
+  }
+
+  if (LOG_ENABLED(INFO)) {
+    LOG(INFO) << "Address resolution for " << hostname
+              << " succeeded: " << host;
+  }
+
+  memcpy(&addr->su, res->ai_addr, res->ai_addrlen);
+  addr->len = res->ai_addrlen;
+
+  return 0;
 }
 
 } // namespace shrpx

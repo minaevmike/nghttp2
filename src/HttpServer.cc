@@ -96,6 +96,7 @@ Config::Config()
       num_worker(1),
       max_concurrent_streams(100),
       header_table_size(-1),
+      encoder_header_table_size(-1),
       window_bits(-1),
       connection_window_bits(-1),
       port(0),
@@ -231,12 +232,20 @@ public:
         config_(config),
         ssl_ctx_(ssl_ctx),
         callbacks_(nullptr),
+        option_(nullptr),
         next_session_id_(1),
         tstamp_cached_(ev_now(loop)),
         cached_date_(util::http_date(tstamp_cached_)) {
     nghttp2_session_callbacks_new(&callbacks_);
 
     fill_callback(callbacks_, config_);
+
+    nghttp2_option_new(&option_);
+
+    if (config_->encoder_header_table_size != -1) {
+      nghttp2_option_set_max_deflate_dynamic_table_size(
+          option_, config_->encoder_header_table_size);
+    }
 
     ev_timer_init(&release_fd_timer_, release_fd_cb, 0., RELEASE_FD_TIMEOUT);
     release_fd_timer_.data = this;
@@ -246,6 +255,7 @@ public:
     for (auto handler : handlers_) {
       delete handler;
     }
+    nghttp2_option_del(option_);
     nghttp2_session_callbacks_del(callbacks_);
   }
   void add_handler(Http2Handler *handler) { handlers_.insert(handler); }
@@ -283,6 +293,7 @@ public:
     return session_id;
   }
   const nghttp2_session_callbacks *get_callbacks() const { return callbacks_; }
+  const nghttp2_option *get_option() const { return option_; }
   void accept_connection(int fd) {
     util::make_socket_nodelay(fd);
     SSL *ssl = nullptr;
@@ -408,6 +419,7 @@ private:
   const Config *config_;
   SSL_CTX *ssl_ctx_;
   nghttp2_session_callbacks *callbacks_;
+  nghttp2_option *option_;
   ev_timer release_fd_timer_;
   int64_t next_session_id_;
   ev_tstamp tstamp_cached_;
@@ -825,7 +837,8 @@ int Http2Handler::on_write() { return write_(*this); }
 int Http2Handler::connection_made() {
   int r;
 
-  r = nghttp2_session_server_new(&session_, sessions_->get_callbacks(), this);
+  r = nghttp2_session_server_new2(&session_, sessions_->get_callbacks(), this,
+                                  sessions_->get_option());
 
   if (r != 0) {
     return r;
@@ -856,10 +869,9 @@ int Http2Handler::connection_made() {
   }
 
   if (config->connection_window_bits != -1) {
-    r = nghttp2_submit_window_update(
+    r = nghttp2_session_set_local_window_size(
         session_, NGHTTP2_FLAG_NONE, 0,
-        (1 << config->connection_window_bits) - 1 -
-            NGHTTP2_INITIAL_CONNECTION_WINDOW_SIZE);
+        (1 << config->connection_window_bits) - 1);
     if (r != 0) {
       return r;
     }
@@ -1121,8 +1133,12 @@ void prepare_status_response(Stream *stream, Http2Handler *hd, int status) {
   data_prd.read_callback = file_read_callback;
 
   HeaderRefs headers;
+  headers.reserve(2);
   headers.emplace_back(StringRef::from_lit("content-type"),
                        StringRef::from_lit("text/html; charset=UTF-8"));
+  headers.emplace_back(
+      StringRef::from_lit("content-length"),
+      util::make_string_ref_uint(stream->balloc, file_ent->length));
   hd->submit_response(StringRef{status_page->status}, stream->stream_id,
                       headers, &data_prd);
 }
@@ -1285,7 +1301,7 @@ void prepare_response(Stream *stream, Http2Handler *hd,
     p = std::copy(std::begin(htdocs), std::end(htdocs), p);
     p = std::copy(std::begin(path), std::end(path), p);
     if (trailing_slash) {
-      p = std::copy(std::begin(DEFAULT_HTML), std::end(DEFAULT_HTML), p);
+      std::copy(std::begin(DEFAULT_HTML), std::end(DEFAULT_HTML), p);
     }
   }
 
@@ -1793,6 +1809,16 @@ void run_worker(Worker *worker) {
 }
 } // namespace
 
+namespace {
+int get_ev_loop_flags() {
+  if (ev_supported_backends() & ~ev_recommended_backends() & EVBACKEND_KQUEUE) {
+    return ev_recommended_backends() | EVBACKEND_KQUEUE;
+  }
+
+  return 0;
+}
+} // namespace
+
 class AcceptHandler {
 public:
   AcceptHandler(HttpServer *sv, Sessions *sessions, const Config *config)
@@ -1805,7 +1831,7 @@ public:
         std::cerr << "spawning thread #" << i << std::endl;
       }
       auto worker = make_unique<Worker>();
-      auto loop = ev_loop_new(0);
+      auto loop = ev_loop_new(get_ev_loop_flags());
       worker->sessions =
           make_unique<Sessions>(sv, loop, config_, sessions_->get_ssl_ctx());
       ev_async_init(&worker->w, worker_acceptcb);
@@ -2056,7 +2082,7 @@ int alpn_select_proto_cb(SSL *ssl, const unsigned char **out,
     std::cout << "[ALPN] client offers:" << std::endl;
   }
   if (config->verbose) {
-    for (unsigned int i = 0; i < inlen; i += in [i] + 1) {
+    for (unsigned int i = 0; i < inlen; i += in[i] + 1) {
       std::cout << " * ";
       std::cout.write(reinterpret_cast<const char *>(&in[i + 1]), in[i]);
       std::cout << std::endl;

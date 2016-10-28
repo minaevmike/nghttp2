@@ -45,6 +45,7 @@
 
 #include "shrpx_config.h"
 #include "shrpx_downstream.h"
+#include "shrpx_worker.h"
 #include "util.h"
 #include "template.h"
 
@@ -105,14 +106,15 @@ Log::Log(int severity, const char *filename, int linenum)
 
 Log::~Log() {
   int rv;
+  auto config = get_config();
 
-  if (!get_config()) {
+  if (!config) {
     return;
   }
 
   auto lgconf = log_config();
 
-  auto &errorconf = get_config()->logging.error;
+  auto &errorconf = config->logging.error;
 
   if (!log_enabled(severity_) ||
       (lgconf->errorlog_fd == -1 && !errorconf.syslog)) {
@@ -136,17 +138,17 @@ Log::~Log() {
   auto tty = lgconf->errorlog_tty;
 
   lgconf->update_tstamp(std::chrono::system_clock::now());
-  auto &time_local = lgconf->time_local_str;
+  auto &time_local = lgconf->time_local;
 
   if (severity_ == NOTICE) {
     rv =
         snprintf(buf, sizeof(buf), "%s PID%d [%s%s%s] %s\n", time_local.c_str(),
-                 get_config()->pid, tty ? SEVERITY_COLOR[severity_] : "",
+                 config->pid, tty ? SEVERITY_COLOR[severity_] : "",
                  SEVERITY_STR[severity_].c_str(), tty ? "\033[0m" : "",
                  stream_.str().c_str());
   } else {
     rv = snprintf(buf, sizeof(buf), "%s PID%d [%s%s%s] %s%s:%d%s %s\n",
-                  time_local.c_str(), get_config()->pid,
+                  time_local.c_str(), config->pid,
                   tty ? SEVERITY_COLOR[severity_] : "",
                   SEVERITY_STR[severity_].c_str(), tty ? "\033[0m" : "",
                   tty ? "\033[1;30m" : "", filename_, linenum_,
@@ -207,7 +209,7 @@ std::pair<OutputIterator, size_t> copy(const ImmutableString &src, size_t avail,
 
 namespace {
 template <size_t N, typename OutputIterator>
-std::pair<OutputIterator, size_t> copy_l(const char(&src)[N], size_t avail,
+std::pair<OutputIterator, size_t> copy_l(const char (&src)[N], size_t avail,
                                          OutputIterator oitr) {
   return copy(src, N - 1, avail, oitr);
 }
@@ -253,8 +255,8 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
   auto avail = sizeof(buf) - 2;
 
   lgconf->update_tstamp(lgsp.time_now);
-  auto &time_local = lgconf->time_local_str;
-  auto &time_iso8601 = lgconf->time_iso8601_str;
+  auto &time_local = lgconf->time_local;
+  auto &time_iso8601 = lgconf->time_iso8601;
 
   for (auto &lf : lfv) {
     switch (lf.type) {
@@ -289,7 +291,7 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
       break;
     case SHRPX_LOGF_HTTP:
       if (req) {
-        auto hd = req->fs.header(StringRef(lf.value));
+        auto hd = req->fs.header(lf.value);
         if (hd) {
           std::tie(p, avail) = copy((*hd).value, avail, p);
           break;
@@ -318,7 +320,8 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
       break;
     case SHRPX_LOGF_REQUEST_TIME: {
       auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   lgsp.request_end_time - lgsp.request_start_time).count();
+                   lgsp.request_end_time - lgsp.request_start_time)
+                   .count();
 
       auto frac = util::utos(t % 1000);
       auto sec = util::utos(t / 1000);
@@ -367,6 +370,21 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
       std::tie(p, avail) =
           copy_l(lgsp.tls_info->session_reused ? "r" : ".", avail, p);
       break;
+    case SHRPX_LOGF_BACKEND_HOST:
+      if (!lgsp.downstream_addr) {
+        std::tie(p, avail) = copy_l("-", avail, p);
+        break;
+      }
+      std::tie(p, avail) = copy(lgsp.downstream_addr->host, avail, p);
+      break;
+    case SHRPX_LOGF_BACKEND_PORT:
+      if (!lgsp.downstream_addr) {
+        std::tie(p, avail) = copy_l("-", avail, p);
+        break;
+      }
+      std::tie(p, avail) =
+          copy(util::utos(lgsp.downstream_addr->port), avail, p);
+      break;
     case SHRPX_LOGF_NONE:
       break;
     default:
@@ -395,8 +413,9 @@ int reopen_log_files() {
   int new_errorlog_fd = -1;
 
   auto lgconf = log_config();
-  auto &accessconf = get_config()->logging.access;
-  auto &errorconf = get_config()->logging.error;
+  auto config = get_config();
+  auto &accessconf = config->logging.access;
+  auto &errorconf = config->logging.error;
 
   if (!accessconf.syslog && !accessconf.file.empty()) {
     new_accesslog_fd = util::open_log_file(accessconf.file.c_str());

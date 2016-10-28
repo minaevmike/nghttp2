@@ -54,8 +54,11 @@
 #include <iostream>
 #include <fstream>
 
+#include <openssl/evp.h>
+
 #include <nghttp2/nghttp2.h>
 
+#include "ssl_compat.h"
 #include "timegm.h"
 
 namespace nghttp2 {
@@ -128,11 +131,10 @@ bool in_attr_char(char c) {
          std::find(std::begin(bad), std::end(bad), c) == std::end(bad);
 }
 
-std::string percent_encode_token(const std::string &target) {
-  std::string dest;
-
-  dest.resize(target.size() * 3);
-  auto p = std::begin(dest);
+StringRef percent_encode_token(BlockAllocator &balloc,
+                               const StringRef &target) {
+  auto iov = make_byte_ref(balloc, target.size() * 3 + 1);
+  auto p = iov.base;
 
   for (auto first = std::begin(target); first != std::end(target); ++first) {
     uint8_t c = *first;
@@ -146,8 +148,10 @@ std::string percent_encode_token(const std::string &target) {
     *p++ = UPPER_XDIGITS[c >> 4];
     *p++ = UPPER_XDIGITS[(c & 0x0f)];
   }
-  dest.resize(p - std::begin(dest));
-  return dest;
+
+  *p = '\0';
+
+  return StringRef{iov.base, p};
 }
 
 uint32_t hex_to_uint(char c) {
@@ -163,25 +167,27 @@ uint32_t hex_to_uint(char c) {
   return c;
 }
 
-std::string quote_string(const std::string &target) {
+StringRef quote_string(BlockAllocator &balloc, const StringRef &target) {
   auto cnt = std::count(std::begin(target), std::end(target), '"');
 
   if (cnt == 0) {
-    return target;
+    return make_string_ref(balloc, target);
   }
 
-  std::string res;
-  res.reserve(target.size() + cnt);
+  auto iov = make_byte_ref(balloc, target.size() + cnt + 1);
+  auto p = iov.base;
 
   for (auto c : target) {
     if (c == '"') {
-      res += "\\\"";
+      *p++ = '\\';
+      *p++ = '"';
     } else {
-      res += c;
+      *p++ = c;
     }
   }
+  *p = '\0';
 
-  return res;
+  return StringRef{iov.base, p};
 }
 
 namespace {
@@ -205,17 +211,20 @@ const char *DAY_OF_WEEK[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 } // namespace
 
 std::string http_date(time_t t) {
+  /* Sat, 27 Sep 2014 06:31:15 GMT */
+  std::string res(29, 0);
+  http_date(&res[0], t);
+  return res;
+}
+
+char *http_date(char *res, time_t t) {
   struct tm tms;
-  std::string res;
 
   if (gmtime_r(&t, &tms) == nullptr) {
     return res;
   }
 
-  /* Sat, 27 Sep 2014 06:31:15 GMT */
-  res.resize(29);
-
-  auto p = std::begin(res);
+  auto p = res;
 
   auto s = DAY_OF_WEEK[tms.tm_wday];
   p = std::copy_n(s, 3, p);
@@ -236,22 +245,24 @@ std::string http_date(time_t t) {
   s = " GMT";
   p = std::copy_n(s, 4, p);
 
-  return res;
+  return p;
 }
 
 std::string common_log_date(time_t t) {
+  // 03/Jul/2014:00:19:38 +0900
+  std::string res(26, 0);
+  common_log_date(&res[0], t);
+  return res;
+}
+
+char *common_log_date(char *res, time_t t) {
   struct tm tms;
 
   if (localtime_r(&t, &tms) == nullptr) {
-    return "";
+    return res;
   }
 
-  // Format data like this:
-  // 03/Jul/2014:00:19:38 +0900
-  std::string res;
-  res.resize(26);
-
-  auto p = std::begin(res);
+  auto p = res;
 
   p = cpydig(p, tms.tm_mday, 2);
   *p++ = '/';
@@ -282,24 +293,27 @@ std::string common_log_date(time_t t) {
   p = cpydig(p, gmtoff / 3600, 2);
   p = cpydig(p, (gmtoff % 3600) / 60, 2);
 
-  return res;
+  return p;
 }
 
 std::string iso8601_date(int64_t ms) {
+  // 2014-11-15T12:58:24.741Z
+  // 2014-11-15T12:58:24.741+09:00
+  std::string res(29, 0);
+  auto p = iso8601_date(&res[0], ms);
+  res.resize(p - &res[0]);
+  return res;
+}
+
+char *iso8601_date(char *res, int64_t ms) {
   time_t sec = ms / 1000;
 
   tm tms;
   if (localtime_r(&sec, &tms) == nullptr) {
-    return "";
+    return res;
   }
 
-  // Format data like this:
-  // 2014-11-15T12:58:24.741Z
-  // 2014-11-15T12:58:24.741+09:00
-  std::string res;
-  res.resize(29);
-
-  auto p = std::begin(res);
+  auto p = res;
 
   p = cpydig(p, tms.tm_year + 1900, 4);
   *p++ = '-';
@@ -334,9 +348,7 @@ std::string iso8601_date(int64_t ms) {
     p = cpydig(p, (gmtoff % 3600) / 60, 2);
   }
 
-  res.resize(p - std::begin(res));
-
-  return res;
+  return p;
 }
 
 time_t parse_http_date(const StringRef &s) {
@@ -373,6 +385,21 @@ std::string format_hex(const unsigned char *s, size_t len) {
   return res;
 }
 
+StringRef format_hex(BlockAllocator &balloc, const StringRef &s) {
+  auto iov = make_byte_ref(balloc, s.size() * 2 + 1);
+  auto p = iov.base;
+
+  for (auto cc : s) {
+    uint8_t c = cc;
+    *p++ = LOWER_XDIGITS[c >> 4];
+    *p++ = LOWER_XDIGITS[c & 0xf];
+  }
+
+  *p = '\0';
+
+  return StringRef{iov.base, p};
+}
+
 void to_token68(std::string &base64str) {
   std::transform(std::begin(base64str), std::end(base64str),
                  std::begin(base64str), [](char c) {
@@ -389,22 +416,32 @@ void to_token68(std::string &base64str) {
                   std::end(base64str));
 }
 
-void to_base64(std::string &token68str) {
-  std::transform(std::begin(token68str), std::end(token68str),
-                 std::begin(token68str), [](char c) {
-                   switch (c) {
-                   case '-':
-                     return '+';
-                   case '_':
-                     return '/';
-                   default:
-                     return c;
-                   }
-                 });
-  if (token68str.size() & 0x3) {
-    token68str.append(4 - (token68str.size() & 0x3), '=');
+StringRef to_base64(BlockAllocator &balloc, const StringRef &token68str) {
+  // At most 3 padding '='
+  auto len = token68str.size() + 3;
+  auto iov = make_byte_ref(balloc, len + 1);
+  auto p = iov.base;
+
+  p = std::transform(std::begin(token68str), std::end(token68str), p,
+                     [](char c) {
+                       switch (c) {
+                       case '-':
+                         return '+';
+                       case '_':
+                         return '/';
+                       default:
+                         return c;
+                       }
+                     });
+
+  auto rem = token68str.size() & 0x3;
+  if (rem) {
+    p = std::fill_n(p, 4 - rem, '=');
   }
-  return;
+
+  *p = '\0';
+
+  return StringRef{iov.base, p};
 }
 
 namespace {
@@ -797,8 +834,9 @@ std::vector<unsigned char> get_default_alpn() {
 std::vector<StringRef> split_str(const StringRef &s, char delim) {
   size_t len = 1;
   auto last = std::end(s);
-  for (auto first = std::begin(s), d = first;
-       (d = std::find(first, last, delim)) != last; ++len, first = d + 1)
+  StringRef::const_iterator d;
+  for (auto first = std::begin(s); (d = std::find(first, last, delim)) != last;
+       ++len, first = d + 1)
     ;
 
   auto list = std::vector<StringRef>(len);
@@ -882,12 +920,21 @@ int create_nonblock_socket(int family) {
 bool check_socket_connected(int fd) {
   int error;
   socklen_t len = sizeof(error);
-  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
-    if (error != 0) {
-      return false;
-    }
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0) {
+    return false;
   }
-  return true;
+
+  return error == 0;
+}
+
+int get_socket_error(int fd) {
+  int error;
+  socklen_t len = sizeof(error);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0) {
+    return -1;
+  }
+
+  return error;
 }
 
 bool ipv6_numeric_addr(const char *host) {
@@ -1106,29 +1153,30 @@ std::string dtos(double n) {
   return utos(static_cast<int64_t>(n)) + "." + (f.size() == 1 ? "0" : "") + f;
 }
 
-std::string make_http_hostport(const StringRef &host, uint16_t port) {
+StringRef make_http_hostport(BlockAllocator &balloc, const StringRef &host,
+                             uint16_t port) {
   if (port != 80 && port != 443) {
-    return make_hostport(host, port);
+    return make_hostport(balloc, host, port);
   }
 
   auto ipv6 = ipv6_numeric_addr(host.c_str());
 
-  std::string hostport;
-  hostport.resize(host.size() + (ipv6 ? 2 : 0));
-
-  auto p = &hostport[0];
+  auto iov = make_byte_ref(balloc, host.size() + (ipv6 ? 2 : 0) + 1);
+  auto p = iov.base;
 
   if (ipv6) {
     *p++ = '[';
   }
 
-  p = std::copy_n(host.c_str(), host.size(), p);
+  p = std::copy(std::begin(host), std::end(host), p);
 
   if (ipv6) {
     *p++ = ']';
   }
 
-  return hostport;
+  *p = '\0';
+
+  return StringRef{iov.base, p};
 }
 
 std::string make_hostport(const StringRef &host, uint16_t port) {
@@ -1154,6 +1202,34 @@ std::string make_hostport(const StringRef &host, uint16_t port) {
   std::copy_n(serv.c_str(), serv.size(), p);
 
   return hostport;
+}
+
+StringRef make_hostport(BlockAllocator &balloc, const StringRef &host,
+                        uint16_t port) {
+  auto ipv6 = ipv6_numeric_addr(host.c_str());
+  auto serv = utos(port);
+
+  auto iov =
+      make_byte_ref(balloc, host.size() + (ipv6 ? 2 : 0) + 1 + serv.size());
+  auto p = iov.base;
+
+  if (ipv6) {
+    *p++ = '[';
+  }
+
+  p = std::copy(std::begin(host), std::end(host), p);
+
+  if (ipv6) {
+    *p++ = ']';
+  }
+
+  *p++ = ':';
+
+  p = std::copy(std::begin(serv), std::end(serv), p);
+
+  *p = '\0';
+
+  return StringRef{iov.base, p};
 }
 
 namespace {
@@ -1314,6 +1390,68 @@ StringRef percent_decode(BlockAllocator &balloc, const StringRef &src) {
   }
   *p = '\0';
   return StringRef{iov.base, p};
+}
+
+// Returns x**y
+double int_pow(double x, size_t y) {
+  auto res = 1.;
+  for (; y; --y) {
+    res *= x;
+  }
+  return res;
+}
+
+uint32_t hash32(const StringRef &s) {
+  /* 32 bit FNV-1a: http://isthe.com/chongo/tech/comp/fnv/ */
+  uint32_t h = 2166136261u;
+  size_t i;
+
+  for (i = 0; i < s.size(); ++i) {
+    h ^= s[i];
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+
+  return h;
+}
+
+#if !OPENSSL_1_1_API
+namespace {
+EVP_MD_CTX *EVP_MD_CTX_new(void) { return EVP_MD_CTX_create(); }
+} // namespace
+
+namespace {
+void EVP_MD_CTX_free(EVP_MD_CTX *ctx) { EVP_MD_CTX_destroy(ctx); }
+} // namespace
+#endif // !OPENSSL_1_1_API
+
+int sha256(uint8_t *res, const StringRef &s) {
+  int rv;
+
+  auto ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) {
+    return -1;
+  }
+
+  auto ctx_deleter = defer(EVP_MD_CTX_free, ctx);
+
+  rv = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+  if (rv != 1) {
+    return -1;
+  }
+
+  rv = EVP_DigestUpdate(ctx, s.c_str(), s.size());
+  if (rv != 1) {
+    return -1;
+  }
+
+  unsigned int mdlen = 32;
+
+  rv = EVP_DigestFinal_ex(ctx, res, &mdlen);
+  if (rv != 1) {
+    return -1;
+  }
+
+  return 0;
 }
 
 } // namespace util

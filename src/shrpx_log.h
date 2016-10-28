@@ -85,6 +85,7 @@ using namespace nghttp2;
 namespace shrpx {
 
 class Downstream;
+struct DownstreamAddr;
 
 enum SeverityLevel { INFO, NOTICE, WARN, ERROR, FATAL };
 
@@ -131,17 +132,20 @@ enum LogFragmentType {
   SHRPX_LOGF_SSL_PROTOCOL,
   SHRPX_LOGF_SSL_SESSION_ID,
   SHRPX_LOGF_SSL_SESSION_REUSED,
+  SHRPX_LOGF_BACKEND_HOST,
+  SHRPX_LOGF_BACKEND_PORT,
 };
 
 struct LogFragment {
-  LogFragment(LogFragmentType type, ImmutableString value = ImmutableString())
+  LogFragment(LogFragmentType type, StringRef value = StringRef::from_lit(""))
       : type(type), value(std::move(value)) {}
   LogFragmentType type;
-  ImmutableString value;
+  StringRef value;
 };
 
 struct LogSpec {
   Downstream *downstream;
+  const DownstreamAddr *downstream_addr;
   StringRef remote_addr;
   StringRef method;
   StringRef path;

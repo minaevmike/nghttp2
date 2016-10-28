@@ -66,11 +66,11 @@ make_array(T &&... t) {
       sizeof...(T)>{{std::forward<T>(t)...}};
 }
 
-template <typename T, size_t N> constexpr size_t array_size(T(&)[N]) {
+template <typename T, size_t N> constexpr size_t array_size(T (&)[N]) {
   return N;
 }
 
-template <typename T, size_t N> constexpr size_t str_size(T(&)[N]) {
+template <typename T, size_t N> constexpr size_t str_size(T (&)[N]) {
   return N - 1;
 }
 
@@ -79,7 +79,7 @@ template <typename T, size_t N> constexpr size_t str_size(T(&)[N]) {
 template <typename F, typename... T> struct Defer {
   Defer(F &&f, T &&... t)
       : f(std::bind(std::forward<F>(f), std::forward<T>(t)...)) {}
-  Defer(Defer &&o) : f(std::move(o.f)) {}
+  Defer(Defer &&o) noexcept : f(std::move(o.f)) {}
   ~Defer() { f(); }
 
   using ResultType = typename std::result_of<typename std::decay<F>::type(
@@ -104,12 +104,13 @@ template <typename T> struct DList {
   DList(const DList &) = delete;
   DList &operator=(const DList &) = delete;
 
-  DList(DList &&other) : head(other.head), tail(other.tail), len(other.len) {
+  DList(DList &&other) noexcept
+      : head(other.head), tail(other.tail), len(other.len) {
     other.head = other.tail = nullptr;
     other.len = 0;
   }
 
-  DList &operator=(DList &&other) {
+  DList &operator=(DList &&other) noexcept {
     if (this == &other) {
       return *this;
     }
@@ -254,17 +255,18 @@ public:
 
   ImmutableString() : len(0), base("") {}
   ImmutableString(const char *s, size_t slen)
-      : len(slen), base(copystr(s, len)) {}
-  ImmutableString(const char *s) : len(strlen(s)), base(copystr(s, len)) {}
-  ImmutableString(const std::string &s)
-      : len(s.size()), base(copystr(s.c_str(), s.size())) {}
+      : len(slen), base(copystr(s, s + len)) {}
+  explicit ImmutableString(const char *s)
+      : len(strlen(s)), base(copystr(s, s + len)) {}
+  explicit ImmutableString(const std::string &s)
+      : len(s.size()), base(copystr(std::begin(s), std::end(s))) {}
   template <typename InputIt>
   ImmutableString(InputIt first, InputIt last)
-      : len(std::distance(first, last)), base(copystr(first, len)) {}
+      : len(std::distance(first, last)), base(copystr(first, last)) {}
   ImmutableString(const ImmutableString &other)
-      : len(other.len), base(copystr(other.base, other.len)) {}
-  ImmutableString(ImmutableString &&other) noexcept : len(other.len),
-                                                      base(other.base) {
+      : len(other.len), base(copystr(std::begin(other), std::end(other))) {}
+  ImmutableString(ImmutableString &&other) noexcept
+      : len(other.len), base(other.base) {
     other.len = 0;
     other.base = "";
   }
@@ -282,7 +284,7 @@ public:
       delete[] base;
     }
     len = other.len;
-    base = copystr(other.base, other.len);
+    base = copystr(std::begin(other), std::end(other));
     return *this;
   }
   ImmutableString &operator=(ImmutableString &&other) noexcept {
@@ -299,7 +301,7 @@ public:
     return *this;
   }
 
-  template <size_t N> static ImmutableString from_lit(const char(&s)[N]) {
+  template <size_t N> static ImmutableString from_lit(const char (&s)[N]) {
     return ImmutableString(s, N - 1);
   }
 
@@ -325,12 +327,12 @@ public:
   const_reference operator[](size_type pos) const { return *(base + pos); }
 
 private:
-  const char *copystr(const char *s, size_t slen) {
-    if (slen == 0) {
+  template <typename InputIt> const char *copystr(InputIt first, InputIt last) {
+    if (first == last) {
       return "";
     }
-    auto res = new char[slen + 1];
-    *std::copy_n(s, slen, res) = '\0';
+    auto res = new char[std::distance(first, last) + 1];
+    *std::copy(first, last, res) = '\0';
     return res;
   }
 
@@ -426,7 +428,7 @@ public:
       : base(reinterpret_cast<const char *>(first)),
         len(std::distance(first, last)) {}
   template <typename CharT, size_t N>
-  constexpr static StringRef from_lit(const CharT(&s)[N]) {
+  constexpr static StringRef from_lit(const CharT (&s)[N]) {
     return StringRef{s, N - 1};
   }
   static StringRef from_maybe_nullptr(const char *s) {
@@ -500,6 +502,10 @@ inline bool operator==(const ImmutableString &lhs, const StringRef &rhs) {
 
 inline bool operator==(const char *lhs, const StringRef &rhs) {
   return rhs == lhs;
+}
+
+inline bool operator!=(const StringRef &lhs, const StringRef &rhs) {
+  return !(lhs == rhs);
 }
 
 inline bool operator!=(const StringRef &lhs, const std::string &rhs) {

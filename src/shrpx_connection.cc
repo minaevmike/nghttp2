@@ -27,6 +27,7 @@
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif // HAVE_UNISTD_H
+#include <netinet/tcp.h>
 
 #include <limits>
 
@@ -36,10 +37,20 @@
 #include "shrpx_memcached_request.h"
 #include "memchunk.h"
 #include "util.h"
+#include "ssl_compat.h"
 
 using namespace nghttp2;
 
 namespace shrpx {
+
+#if !OPENSSL_1_1_API
+
+void *BIO_get_data(BIO *bio) { return bio->ptr; }
+void BIO_set_data(BIO *bio, void *ptr) { bio->ptr = ptr; }
+void BIO_set_init(BIO *bio, int init) { bio->init = init; }
+
+#endif // !OPENSSL_1_1_API
+
 Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
                        MemchunkPool *mcpool, ev_tstamp write_timeout,
                        ev_tstamp read_timeout,
@@ -51,9 +62,6 @@ Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
     : tls{DefaultMemchunks(mcpool), DefaultPeekMemchunks(mcpool)},
       wlimit(loop, &wev, write_limit.rate, write_limit.burst),
       rlimit(loop, &rev, read_limit.rate, read_limit.burst, this),
-      writecb(writecb),
-      readcb(readcb),
-      timeoutcb(timeoutcb),
       loop(loop),
       data(data),
       fd(fd),
@@ -81,13 +89,7 @@ Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
   }
 }
 
-Connection::~Connection() {
-  disconnect();
-
-  if (tls.ssl) {
-    SSL_free(tls.ssl);
-  }
-}
+Connection::~Connection() { disconnect(); }
 
 void Connection::disconnect() {
   if (tls.ssl) {
@@ -104,12 +106,9 @@ void Connection::disconnect() {
       tls.cached_session_lookup_req = nullptr;
     }
 
-    // To reuse SSL/TLS session, we have to shutdown, and don't free
-    // tls.ssl.
-    if (SSL_shutdown(tls.ssl) != 1) {
-      SSL_free(tls.ssl);
-      tls.ssl = nullptr;
-    }
+    SSL_shutdown(tls.ssl);
+    SSL_free(tls.ssl);
+    tls.ssl = nullptr;
 
     tls.wbuf.reset();
     tls.rbuf.reset();
@@ -149,7 +148,7 @@ int shrpx_bio_write(BIO *b, const char *buf, int len) {
     return 0;
   }
 
-  auto conn = static_cast<Connection *>(b->ptr);
+  auto conn = static_cast<Connection *>(BIO_get_data(b));
   auto &wbuf = conn->tls.wbuf;
 
   BIO_clear_retry_flags(b);
@@ -190,7 +189,7 @@ int shrpx_bio_read(BIO *b, char *buf, int len) {
     return 0;
   }
 
-  auto conn = static_cast<Connection *>(b->ptr);
+  auto conn = static_cast<Connection *>(BIO_get_data(b));
   auto &rbuf = conn->tls.rbuf;
 
   BIO_clear_retry_flags(b);
@@ -239,10 +238,14 @@ long shrpx_bio_ctrl(BIO *b, int cmd, long num, void *ptr) {
 
 namespace {
 int shrpx_bio_create(BIO *b) {
+#if OPENSSL_1_1_API
+  BIO_set_init(b, 1);
+#else  // !OPENSSL_1_1_API
   b->init = 1;
   b->num = 0;
   b->ptr = nullptr;
   b->flags = 0;
+#endif // !OPENSSL_1_1_API
   return 1;
 }
 } // namespace
@@ -253,26 +256,55 @@ int shrpx_bio_destroy(BIO *b) {
     return 0;
   }
 
+#if !OPENSSL_1_1_API
   b->ptr = nullptr;
   b->init = 0;
   b->flags = 0;
+#endif // !OPENSSL_1_1_API
 
   return 1;
 }
 } // namespace
 
-namespace {
-BIO_METHOD shrpx_bio_method = {
-    BIO_TYPE_FD,    "nghttpx-bio",    shrpx_bio_write,
-    shrpx_bio_read, shrpx_bio_puts,   shrpx_bio_gets,
-    shrpx_bio_ctrl, shrpx_bio_create, shrpx_bio_destroy,
-};
-} // namespace
+#if OPENSSL_1_1_API
+
+BIO_METHOD *create_bio_method() {
+  auto meth = BIO_meth_new(BIO_TYPE_FD, "nghttpx-bio");
+  BIO_meth_set_write(meth, shrpx_bio_write);
+  BIO_meth_set_read(meth, shrpx_bio_read);
+  BIO_meth_set_puts(meth, shrpx_bio_puts);
+  BIO_meth_set_gets(meth, shrpx_bio_gets);
+  BIO_meth_set_ctrl(meth, shrpx_bio_ctrl);
+  BIO_meth_set_create(meth, shrpx_bio_create);
+  BIO_meth_set_destroy(meth, shrpx_bio_destroy);
+
+  return meth;
+}
+
+void delete_bio_method(BIO_METHOD *bio_method) { BIO_meth_free(bio_method); }
+
+#else // !OPENSSL_1_1_API
+
+BIO_METHOD *create_bio_method() {
+  static BIO_METHOD shrpx_bio_method = {
+      BIO_TYPE_FD,    "nghttpx-bio",    shrpx_bio_write,
+      shrpx_bio_read, shrpx_bio_puts,   shrpx_bio_gets,
+      shrpx_bio_ctrl, shrpx_bio_create, shrpx_bio_destroy,
+  };
+
+  return &shrpx_bio_method;
+}
+
+void delete_bio_method(BIO_METHOD *bio_method) {}
+
+#endif // !OPENSSL_1_1_API
 
 void Connection::set_ssl(SSL *ssl) {
   tls.ssl = ssl;
-  auto bio = BIO_new(&shrpx_bio_method);
-  bio->ptr = this;
+
+  auto &tlsconf = get_config()->tls;
+  auto bio = BIO_new(tlsconf.bio_method);
+  BIO_set_data(bio, this);
   SSL_set_bio(tls.ssl, bio, bio);
   SSL_set_app_data(tls.ssl, this);
 }
@@ -582,8 +614,8 @@ ssize_t Connection::write_tls(const void *data, size_t len) {
       return 0;
     case SSL_ERROR_SSL:
       if (LOG_ENABLED(INFO)) {
-        LOG(INFO) << "SSL_write: " << ERR_error_string(ERR_get_error(),
-                                                       nullptr);
+        LOG(INFO) << "SSL_write: "
+                  << ERR_error_string(ERR_get_error(), nullptr);
       }
       return SHRPX_ERR_NETWORK;
     default:
@@ -593,8 +625,6 @@ ssize_t Connection::write_tls(const void *data, size_t len) {
       return SHRPX_ERR_NETWORK;
     }
   }
-
-  wlimit.drain(rv);
 
   update_tls_warmup_writelen(rv);
 
@@ -646,8 +676,6 @@ ssize_t Connection::read_tls(void *data, size_t len) {
       return SHRPX_ERR_NETWORK;
     }
   }
-
-  rlimit.drain(rv);
 
   return rv;
 }
@@ -728,6 +756,57 @@ void Connection::handle_tls_pending_read() {
     return;
   }
   rlimit.handle_tls_pending_read();
+}
+
+int Connection::get_tcp_hint(TCPHint *hint) const {
+#if defined(TCP_INFO) && defined(TCP_NOTSENT_LOWAT)
+  struct tcp_info tcp_info;
+  socklen_t tcp_info_len = sizeof(tcp_info);
+  int rv;
+
+  rv = getsockopt(fd, IPPROTO_TCP, TCP_INFO, &tcp_info, &tcp_info_len);
+
+  if (rv != 0) {
+    return -1;
+  }
+
+  auto avail_packets = tcp_info.tcpi_snd_cwnd > tcp_info.tcpi_unacked
+                           ? tcp_info.tcpi_snd_cwnd - tcp_info.tcpi_unacked
+                           : 0;
+
+  // http://www.slideshare.net/kazuho/programming-tcp-for-responsiveness
+  //
+  // TODO 29 (5 + 8 + 16) is TLS overhead for AES-GCM.  For
+  // CHACHA20_POLY1305, it is 21 since it does not need 8 bytes
+  // explicit nonce.
+  auto writable_size = (avail_packets + 2) * (tcp_info.tcpi_snd_mss - 29);
+  if (writable_size > 16_k) {
+    writable_size = writable_size & ~(16_k - 1);
+  } else {
+    if (writable_size < 536) {
+      LOG(INFO) << "writable_size is too small: " << writable_size;
+    }
+    // TODO is this required?
+    writable_size = std::max(writable_size, static_cast<uint32_t>(536 * 2));
+  }
+
+  // if (LOG_ENABLED(INFO)) {
+  //   LOG(INFO) << "snd_cwnd=" << tcp_info.tcpi_snd_cwnd
+  //             << ", unacked=" << tcp_info.tcpi_unacked
+  //             << ", snd_mss=" << tcp_info.tcpi_snd_mss
+  //             << ", rtt=" << tcp_info.tcpi_rtt << "us"
+  //             << ", rcv_space=" << tcp_info.tcpi_rcv_space
+  //             << ", writable=" << writable_size;
+  // }
+
+  hint->write_buffer_size = writable_size;
+  // TODO tcpi_rcv_space is considered as rwin, is that correct?
+  hint->rwin = tcp_info.tcpi_rcv_space;
+
+  return 0;
+#else  // !defined(TCP_INFO) || !defined(TCP_NOTSENT_LOWAT)
+  return -1;
+#endif // !defined(TCP_INFO) || !defined(TCP_NOTSENT_LOWAT)
 }
 
 } // namespace shrpx

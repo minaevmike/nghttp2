@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "NGHTTPD" "1" "April 10, 2016" "1.10.0-DEV" "nghttp2"
+.TH "NGHTTPD" "1" "Oct 24, 2016" "1.16.0" "nghttp2"
 .SH NAME
 nghttpd \- HTTP/2 server
 .
@@ -96,6 +96,14 @@ Disable SSL/TLS.
 .TP
 .B \-c, \-\-header\-table\-size=<SIZE>
 Specify decoder header table size.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-encoder\-header\-table\-size=<SIZE>
+Specify encoder header table size.  The decoder (client)
+specifies  the maximum  dynamic table  size it  accepts.
+Then the negotiated dynamic table size is the minimum of
+this option value and the value which client specified.
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -209,7 +217,7 @@ The <SIZE> argument is an integer and an optional unit (e.g., 10K is
 10 * 1024).  Units are K, M and G (powers of 1024).
 .SH SEE ALSO
 .sp
-\fInghttp(1)\fP, \fInghttpx(1)\fP, \fIh2load(1)\fP
+\fBnghttp(1)\fP, \fBnghttpx(1)\fP, \fBh2load(1)\fP
 .SH AUTHOR
 Tatsuhiro Tsujikawa
 .SH COPYRIGHT

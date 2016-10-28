@@ -22,7 +22,10 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 SUBDIRS = includes
 
-EXTRA_DIST = CMakeLists.txt
+EXTRA_DIST = \
+	CMakeLists.txt \
+	test.example.com.pem \
+	test.nghttp2.org.pem
 
 bin_PROGRAMS =
 check_PROGRAMS =
@@ -132,7 +135,12 @@ NGHTTPX_SRCS = \
 	shrpx_process.h \
 	shrpx_signal.cc shrpx_signal.h \
 	shrpx_router.cc shrpx_router.h \
-	buffer.h memchunk.h template.h allocator.h
+	shrpx_api_downstream_connection.cc shrpx_api_downstream_connection.h \
+	shrpx_health_monitor_downstream_connection.cc \
+	shrpx_health_monitor_downstream_connection.h \
+	shrpx_exec.cc shrpx_exec.h \
+	buffer.h memchunk.h template.h allocator.h \
+	xsi_strerror.c xsi_strerror.h
 
 if HAVE_SPDYLAY
 NGHTTPX_SRCS += shrpx_spdy_upstream.cc shrpx_spdy_upstream.h
@@ -174,6 +182,7 @@ nghttpx_unittest_SOURCES = shrpx-unittest.cc \
 	shrpx_config_test.cc shrpx_config_test.h \
 	shrpx_worker_test.cc shrpx_worker_test.h \
 	shrpx_http_test.cc shrpx_http_test.h \
+	shrpx_router_test.cc shrpx_router_test.h \
 	http2_test.cc http2_test.h \
 	util_test.cc util_test.h \
 	nghttp2_gzip_test.c nghttp2_gzip_test.h \
@@ -183,7 +192,7 @@ nghttpx_unittest_SOURCES = shrpx-unittest.cc \
 	template_test.cc template_test.h \
 	base64_test.cc base64_test.h
 nghttpx_unittest_CPPFLAGS = ${AM_CPPFLAGS} \
-	-DNGHTTP2_TESTS_DIR=\"$(top_srcdir)/tests\"
+	-DNGHTTP2_SRC_DIR=\"$(top_srcdir)/src\"
 nghttpx_unittest_LDADD = libnghttpx.a ${LDADD} @CUNIT_LIBS@ @TESTLDADD@
 
 if HAVE_MRUBY
@@ -226,6 +235,7 @@ lib_LTLIBRARIES = libnghttp2_asio.la
 libnghttp2_asio_la_SOURCES = \
 	util.cc util.h http2.cc http2.h \
 	ssl.cc ssl.h \
+	ssl_compat.h \
 	timegm.c timegm.h \
 	asio_common.cc asio_common.h \
 	asio_io_service_pool.cc asio_io_service_pool.h \

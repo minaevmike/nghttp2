@@ -50,12 +50,14 @@
 #include <openssl/ssl.h>
 
 #include "http2.h"
-#include "buffer.h"
+#include "memchunk.h"
 #include "template.h"
 
 using namespace nghttp2;
 
 namespace h2load {
+
+constexpr auto BACKOFF_WRITE_BUFFER_THRES = 16_k;
 
 class Session;
 struct Worker;
@@ -94,6 +96,8 @@ struct Config {
     PROTO_SPDY3_1,
     PROTO_HTTP1_1
   } no_tls_proto;
+  uint32_t header_table_size;
+  uint32_t encoder_header_table_size;
   // file descriptor for upload data
   int data_fd;
   uint16_t port;
@@ -225,6 +229,7 @@ struct Sampling {
 };
 
 struct Worker {
+  MemchunkPool mcpool;
   Stats stats;
   Sampling request_times_smp;
   Sampling client_smp;
@@ -267,6 +272,7 @@ struct Stream {
 };
 
 struct Client {
+  DefaultMemchunks wb;
   std::unordered_map<int32_t, Stream> streams;
   ClientStat cstat;
   std::unique_ptr<Session> session;
@@ -293,11 +299,13 @@ struct Client {
   // The client id per worker
   uint32_t id;
   int fd;
-  Buffer<64_k> wb;
   ev_timer conn_active_watcher;
   ev_timer conn_inactivity_watcher;
   std::string selected_proto;
   bool new_connection_requested;
+  // true if the current connection will be closed, and no more new
+  // request cannot be processed.
+  bool final;
 
   enum { ERR_CONNECT_FAIL = -100 };
 

@@ -48,12 +48,16 @@ explicitly.
 The backend is supposed to be Web server.  For example, to make
 nghttpx listen to encrypted HTTP/2 requests at port 8443, and a
 backend Web server is configured to listen to HTTP request at port
-8080 in the same host, run nghttpx command-line like this::
+8080 in the same host, run nghttpx command-line like this:
+
+.. code-block:: text
 
     $ nghttpx -f0.0.0.0,8443 -b127.0.0.1,8080 /path/to/server.key /path/to/server.crt
 
 Then HTTP/2 enabled client can access to the nghttpx in HTTP/2.  For
-example, you can send GET request to the server using nghttp::
+example, you can send GET request to the server using nghttp:
+
+.. code-block:: text
 
     $ nghttp -nv https://localhost:8443/
 
@@ -89,7 +93,9 @@ connection, use :option:`--backend` option, and specify ``h2`` in
 For example, to make nghttpx listen to encrypted HTTP/2 requests at
 port 8443, and a backend HTTP proxy server is configured to listen to
 HTTP/1 request at port 8080 in the same host, run nghttpx command-line
-like this::
+like this:
+
+.. code-block:: text
 
     $ nghttpx -s -f'*,8443' -b127.0.0.1,8080 /path/to/server.key /path/to/server.crt
 
@@ -118,13 +124,17 @@ to proxy.pac file, something like this:
 
     file:///path/to/proxy.pac
 
-For Chromium, use following command-line::
+For Chromium, use following command-line:
+
+.. code-block:: text
 
     $ google-chrome --proxy-pac-url=file:///path/to/proxy.pac --use-npn
 
 As HTTP/1 proxy server, Squid may work as out-of-box.  Traffic server
 requires to be configured as forward proxy.  Here is the minimum
-configuration items to edit::
+configuration items to edit:
+
+.. code-block:: text
 
     CONFIG proxy.config.reverse_proxy.enabled INT 0
     CONFIG proxy.config.url_remap.remap_required INT 0
@@ -133,6 +143,11 @@ Consult Traffic server `documentation
 <http://trafficserver.readthedocs.org/en/latest/admin-guide/configuration/transparent-forward-proxying.en.html>`_
 to know how to configure traffic server as forward proxy and its
 security implications.
+
+ALPN support
+------------
+
+ALPN support requires OpenSSL >= 1.0.2.
 
 Disable frontend SSL/TLS
 ------------------------
@@ -152,9 +167,9 @@ Enable SSL/TLS on memcached connection
 --------------------------------------
 
 By default, memcached connection is not encrypted.  To enable
-encryption, use :option:`--tls-ticket-key-memcached-tls` for TLS
-ticket key, and use :option:`--tls-session-cache-memcached-tls` for
-TLS session cache.
+encryption, use ``tls`` keyword in
+:option:`--tls-ticket-key-memcached` for TLS ticket key, and
+:option:`--tls-session-cache-memcached` for TLS session cache.
 
 Specifying additional server certificates
 -----------------------------------------
@@ -196,17 +211,17 @@ Rewriting location header field
 nghttpx automatically rewrites location response header field if the
 following all conditions satisfy:
 
-* URI in location header field is not absolute URI or is not https URI.
+* In the default mode (:option:`--http2-proxy` is not used)
+* :option:`--no-location-rewrite` is not used
+* URI in location header field is an absolute URI
 * URI in location header field includes non empty host component.
 * host (without port) in URI in location header field must match the
-  host appearing in :authority or host header field.
+  host appearing in ``:authority`` or ``host`` header field.
 
-When rewrite happens, URI scheme and port are replaced with the ones
-used in frontend, and host is replaced with which appears in
-:authority or host request header field.  :authority header field has
-precedence.  If the above conditions are not met with the host value
-in :authority header field, rewrite is retried with the value in host
-header field.
+When rewrite happens, URI scheme is replaced with the ones used in
+frontend, and authority is replaced with which appears in
+``:authority``, or ``host`` request header field.  ``:authority``
+header field has precedence over ``host``.
 
 Hot swapping
 ------------
@@ -220,6 +235,9 @@ current process, send QUIT signal to current nghttpx process.  When
 all existing frontend connections are done, the current process will
 exit.  At this point, only new nghttpx process exists and serves
 incoming requests.
+
+If you want to just reload configuration file without executing new
+binary, send SIGHUP to nghttpx master process.
 
 Re-opening log files
 --------------------
@@ -383,3 +401,12 @@ Use following options instead of ``--client-proxy``:
    http2-proxy=yes
    frontend=<ADDR>,<PORT>;no-tls
    backend=<ADDR>,<PORT>;;proto=h2;tls
+
+We also removed ``--backend-http2-connections-per-worker`` option.  It
+was present because previously the number of backend h2 connection was
+statically configured, and defaulted to 1.  Now the number of backend
+h2 connection is increased on demand.  We know the maximum number of
+concurrent streams per connection.  When we push as many request as
+the maximum concurrency to the one connection, we create another new
+connection so that we can distribute load and avoid delay the request
+processing.  This is done automatically without any configuration.

@@ -49,6 +49,8 @@ namespace shrpx {
 class Upstream;
 class DownstreamConnection;
 struct BlockedLink;
+struct DownstreamAddrGroup;
+struct DownstreamAddr;
 
 class FieldStore {
 public:
@@ -84,6 +86,11 @@ public:
   void add_header_token(const StringRef &name, const StringRef &value,
                         bool no_index, int32_t token);
 
+  // Adds header field name |name|.  First, the copy of header field
+  // name pointed by name.c_str() of length name.size() is made, and
+  // stored.
+  void alloc_add_header_name(const StringRef &name);
+
   void append_last_header_key(const char *data, size_t len);
   void append_last_header_value(const char *data, size_t len);
 
@@ -98,6 +105,11 @@ public:
 
   void add_trailer_token(const StringRef &name, const StringRef &value,
                          bool no_index, int32_t token);
+
+  // Adds trailer field name |name|.  First, the copy of trailer field
+  // name pointed by name.c_str() of length name.size() is made, and
+  // stored.
+  void alloc_add_trailer_name(const StringRef &name);
 
   void append_last_trailer_key(const char *data, size_t len);
   void append_last_trailer_value(const char *data, size_t len);
@@ -185,7 +197,8 @@ struct Response {
         http_status(0),
         http_major(1),
         http_minor(1),
-        connection_close(false) {}
+        connection_close(false),
+        headers_only(false) {}
 
   void consume(size_t len) {
     assert(unconsumed_body_length >= len);
@@ -202,6 +215,10 @@ struct Response {
   unsigned int http_status;
   int http_major, http_minor;
   bool connection_close;
+  // true if response only consists of HEADERS, and it bears
+  // END_STREAM.  This is used to tell Http2Upstream that it can send
+  // response with single HEADERS with END_STREAM flag only.
+  bool headers_only;
 };
 
 class Downstream {
@@ -273,6 +290,7 @@ public:
   bool validate_request_recv_body_length() const;
   void set_request_downstream_host(const StringRef &host);
   bool expect_response_body() const;
+  bool expect_response_trailer() const;
   enum {
     INITIAL,
     HEADER_COMPLETE,
@@ -294,7 +312,11 @@ public:
   DefaultMemchunks *get_request_buf();
   void set_request_pending(bool f);
   bool get_request_pending() const;
+  void set_request_header_sent(bool f);
   // Returns true if request is ready to be submitted to downstream.
+  // When sending pending request, get_request_pending() should be
+  // checked too because this function may return true when
+  // get_request_pending() returns false.
   bool request_submission_ready() const;
 
   // downstream response API
@@ -376,6 +398,12 @@ public:
 
   void add_rcbuf(nghttp2_rcbuf *rcbuf);
 
+  void
+  set_downstream_addr_group(const std::shared_ptr<DownstreamAddrGroup> &group);
+  void set_addr(const DownstreamAddr *addr);
+
+  const DownstreamAddr *get_addr() const;
+
   enum {
     EVENT_ERROR = 0x1,
     EVENT_TIMEOUT = 0x2,
@@ -423,6 +451,10 @@ private:
 
   // only used by HTTP/2 or SPDY upstream
   BlockedLink *blocked_link_;
+  // The backend address used to fulfill this request.  These are for
+  // logging purpose.
+  std::shared_ptr<DownstreamAddrGroup> group_;
+  const DownstreamAddr *addr_;
   // How many times we tried in backend connection
   size_t num_retry_;
   // The stream ID in frontend connection
@@ -453,6 +485,8 @@ private:
   // has not been established or should be checked before use;
   // currently used only with HTTP/2 connection.
   bool request_pending_;
+  // true if downstream request header is considered to be sent.
+  bool request_header_sent_;
 };
 
 } // namespace shrpx

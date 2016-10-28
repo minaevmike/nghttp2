@@ -58,6 +58,11 @@ To build the documentation, you need to install:
 
 * sphinx (http://sphinx-doc.org/)
 
+If you need libnghttp2 (C library) only, then the above packages are
+all you need.  Use ``--enable-lib-only`` to ensure that only
+libnghttp2 is built.  This avoids potential build error related to
+building bundled applications.
+
 To build and run the application programs (``nghttp``, ``nghttpd``,
 ``nghttpx`` and ``h2load``) in the ``src`` directory, the following packages
 are required:
@@ -104,7 +109,9 @@ The Python bindings require the following packages:
 * python >= 2.7
 * python-setuptools
 
-If you are using Ubuntu 14.04 LTS (trusty) or Debian 7.0 (wheezy) and above run the following to install the needed packages::
+If you are using Ubuntu 14.04 LTS (trusty) or Debian 7.0 (wheezy) and above run the following to install the needed packages:
+
+.. code-block:: text
 
     sudo apt-get install g++ make binutils autoconf automake autotools-dev libtool pkg-config \
       zlib1g-dev libcunit1-dev libssl-dev libxml2-dev libev-dev libevent-dev libjansson-dev \
@@ -138,7 +145,9 @@ Building from git
 -----------------
 
 Building from git is easy, but please be sure that at least autoconf 2.68 is
-used::
+used:
+
+.. code-block:: text
 
     $ autoreconf -i
     $ automake
@@ -172,6 +181,23 @@ To compile the source code, gcc >= 4.8.3 or clang >= 3.4 is required.
    applications were not built, then using ``--enable-app`` may find
    that cause, such as the missing dependency.
 
+Notes for building on Windows (MSVC)
+------------------------------------
+
+The easiest way to build native Windows nghttp2 dll is use `cmake
+<https://cmake.org/>`_.  The free version of `Visual C++ Build Tools
+<http://landinghub.visualstudio.com/visual-cpp-build-tools>`_ works
+fine.
+
+1. Install cmake for windows
+2. Open "Visual C++ ... Native Build Tool Command Prompt", and inside
+   nghttp2 directly, run ``cmake``.
+3. Then run ``cmake --build`` to build library.
+4. nghttp2.dll, nghttp2.lib, nghttp2.exp are placed under lib directory.
+
+Note that the above steps most likely produce nghttp2 library only.
+No bundled applications are compiled.
+
 Notes for building on Windows (Mingw/Cygwin)
 --------------------------------------------
 
@@ -188,7 +214,9 @@ Secondly, you need to undefine the macro ``__STRICT_ANSI__``, if you
 not, the functions ``fdopen``, ``fileno`` and ``strptime`` will not
 available.
 
-the sample command like this::
+the sample command like this:
+
+.. code-block:: text
 
     $ export CFLAGS="-U__STRICT_ANSI__ -I$libev_PREFIX/include -L$libev_PREFIX/lib"
     $ export CXXFLAGS=$CFLAGS
@@ -206,7 +234,9 @@ Building the documentation
 
    Documentation is still incomplete.
 
-To build the documentation, run::
+To build the documentation, run:
+
+.. code-block:: text
 
     $ make html
 
@@ -235,12 +265,16 @@ its testing framework.  We depend on the following libraries:
 * https://github.com/tatsuhiro-t/spdy
 
 To download the above packages, after settings ``GOPATH``, run the
-following command under ``integration-tests`` directory::
+following command under ``integration-tests`` directory:
+
+.. code-block:: text
 
     $ make itprep
 
 To run the tests, run the following command under
-``integration-tests`` directory::
+``integration-tests`` directory:
+
+.. code-block:: text
 
     $ make it
 
@@ -361,7 +395,9 @@ nghttp - client
 with prior knowledge, HTTP Upgrade and NPN/ALPN TLS extension.
 
 It has verbose output mode for framing information.  Here is sample
-output from ``nghttp`` client::
+output from ``nghttp`` client:
+
+.. code-block:: text
 
     $ nghttp -nv https://nghttp2.org
     [  0.190] Connected
@@ -444,7 +480,9 @@ output from ``nghttp`` client::
     [  0.228] send GOAWAY frame <length=8, flags=0x00, stream_id=0>
 	      (last_stream_id=2, error_code=NO_ERROR(0x00), opaque_data(0)=[])
 
-The HTTP Upgrade is performed like so::
+The HTTP Upgrade is performed like so:
+
+.. code-block:: text
 
     $ nghttp -nvu http://nghttp2.org
     [  0.011] Connected
@@ -540,7 +578,9 @@ The HTTP Upgrade is performed like so::
 	      (last_stream_id=2, error_code=NO_ERROR(0x00), opaque_data(0)=[])
 
 Using the ``-s`` option, ``nghttp`` prints out some timing information for
-requests, sorted by completion time::
+requests, sorted by completion time:
+
+.. code-block:: text
 
     $ nghttp -nas https://nghttp2.org/
     ***** Statistics *****
@@ -584,7 +624,9 @@ HTTP/2 connections.  No HTTP Upgrade is supported.
 The ``-p`` option allows users to configure server push.
 
 Just like ``nghttp``, it has a verbose output mode for framing
-information.  Here is sample output from ``nghttpd``::
+information.  Here is sample output from ``nghttpd``:
+
+.. code-block:: text
 
     $ nghttpd --no-tls -v 8080
     IPv4: listen 0.0.0.0:8080
@@ -688,13 +730,17 @@ are not encrypted by default.  To encrypt backend connections, use
 sample configuration file ``nghttpx.conf.sample``.
 
 In the default mode, ``nghttpx`` works as reverse proxy to the backend
-server::
+server:
+
+.. code-block:: text
 
     Client <-- (HTTP/2, SPDY, HTTP/1.1) --> nghttpx <-- (HTTP/1.1, HTTP/2) --> Web Server
                                           [reverse proxy]
 
 With the ``--http2-proxy`` option, it works as forward proxy, and it
-is so called secure HTTP/2 proxy (aka SPDY proxy)::
+is so called secure HTTP/2 proxy (aka SPDY proxy):
+
+.. code-block:: text
 
     Client <-- (HTTP/2, SPDY, HTTP/1.1) --> nghttpx <-- (HTTP/1.1) --> Proxy
                                            [secure proxy]          (e.g., Squid, ATS)
@@ -716,14 +762,18 @@ create a proxy.pac script like this:
 machine nghttpx is running on.  Please note that Chrome requires a valid
 certificate for secure proxy.
 
-Then run Chrome with the following arguments::
+Then run Chrome with the following arguments:
+
+.. code-block:: text
 
     $ google-chrome --proxy-pac-url=file:///path/to/proxy.pac --use-npn
 
 The backend HTTP/2 connections can be tunneled through an HTTP proxy.
 The proxy is specified using ``--backend-http-proxy-uri``.  The
 following figure illustrates how nghttpx talks to the outside HTTP/2
-proxy through an HTTP proxy::
+proxy through an HTTP proxy:
+
+.. code-block:: text
 
     Client <-- (HTTP/2, SPDY, HTTP/1.1) --> nghttpx <-- (HTTP/2) --
 
@@ -737,7 +787,9 @@ The ``h2load`` program is a benchmarking tool for HTTP/2 and SPDY.
 The SPDY support is enabled if the program was built with the spdylay
 library.  The UI of ``h2load`` is heavily inspired by ``weighttp``
 (https://github.com/lighttpd/weighttp).  The typical usage is as
-follows::
+follows:
+
+.. code-block:: text
 
     $ h2load -n100000 -c100 -m100 https://localhost:8443/
     starting benchmark...
@@ -825,7 +877,9 @@ Example:
 With the ``-t`` option, the program can accept more familiar HTTP/1 style
 header field blocks.  Each header set is delimited by an empty line:
 
-Example::
+Example:
+
+.. code-block:: text
 
     :method: GET
     :scheme: https
@@ -1321,7 +1375,7 @@ The extension module is called ``nghttp2``.
 determined by the ``configure`` script.  If the detected Python version is not
 what you expect, specify a path to Python executable in a ``PYTHON``
 variable as an argument to configure script (e.g., ``./configure
-PYTHON=/usr/bin/python3.4``).
+PYTHON=/usr/bin/python3.5``).
 
 The following example code illustrates basic usage of the HPACK compressor
 and decompressor in Python:
@@ -1451,6 +1505,17 @@ See `Contribution Guidelines
 <https://nghttp2.org/documentation/contribute.html>`_ for more
 details.
 
+Reporting vulnerability
+-----------------------
+
+If you find a vulnerability in our software, please send the email to
+"tatsuhiro.t at gmail dot com" about its details instead of submitting
+issues on github issue page.  It is a standard practice not to
+disclose vulnerability information publicly until a fixed version is
+released, or mitigation is worked out.
+
+In the future, we may setup a dedicated mail address for this purpose.
+
 Release schedule
 ----------------
 
@@ -1463,3 +1528,8 @@ severe security bug fixes.
 
 We have no plan to break API compatibility changes involving soname
 bump, so MAJOR version will stay 1 for the foreseeable future.
+
+License
+-------
+
+The MIT License

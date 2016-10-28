@@ -124,6 +124,7 @@ Downstream::Downstream(Upstream *upstream, MemchunkPool *mcpool,
       response_buf_(mcpool),
       upstream_(upstream),
       blocked_link_(nullptr),
+      addr_(nullptr),
       num_retry_(0),
       stream_id_(stream_id),
       assoc_stream_id_(-1),
@@ -136,7 +137,8 @@ Downstream::Downstream(Upstream *upstream, MemchunkPool *mcpool,
       chunked_request_(false),
       chunked_response_(false),
       expect_final_response_(false),
-      request_pending_(false) {
+      request_pending_(false),
+      request_header_sent_(false) {
 
   auto &timeoutconf = get_config()->http2.timeout;
 
@@ -358,20 +360,30 @@ void add_header(bool &key_prev, size_t &sum, HeaderRefs &headers,
 } // namespace
 
 namespace {
+StringRef alloc_header_name(BlockAllocator &balloc, const StringRef &name) {
+  auto iov = make_byte_ref(balloc, name.size() + 1);
+  auto p = iov.base;
+  p = std::copy(std::begin(name), std::end(name), p);
+  util::inp_strlower(iov.base, p);
+  *p = '\0';
+
+  return StringRef{iov.base, p};
+}
+} // namespace
+
+namespace {
 void append_last_header_key(BlockAllocator &balloc, bool &key_prev, size_t &sum,
                             HeaderRefs &headers, const char *data, size_t len) {
   assert(key_prev);
   sum += len;
   auto &item = headers.back();
-  auto iov = make_byte_ref(balloc, item.name.size() + len + 1);
-  auto p = iov.base;
-  p = std::copy(std::begin(item.name), std::end(item.name), p);
-  p = std::copy_n(data, len, p);
-  util::inp_strlower(p - len, p);
-  *p = '\0';
+  auto name =
+      realloc_concat_string_ref(balloc, item.name, StringRef{data, len});
 
-  item.name = StringRef{iov.base, p};
+  auto p = const_cast<uint8_t *>(name.byte());
+  util::inp_strlower(p + name.size() - len, p + name.size());
 
+  item.name = name;
   item.token = http2::lookup_token(item.name);
 }
 } // namespace
@@ -383,7 +395,8 @@ void append_last_header_value(BlockAllocator &balloc, bool &key_prev,
   key_prev = false;
   sum += len;
   auto &item = headers.back();
-  item.value = concat_string_ref(balloc, item.value, StringRef{data, len});
+  item.value =
+      realloc_concat_string_ref(balloc, item.value, StringRef{data, len});
 }
 } // namespace
 
@@ -437,6 +450,12 @@ void FieldStore::add_header_token(const StringRef &name, const StringRef &value,
                     no_index, token);
 }
 
+void FieldStore::alloc_add_header_name(const StringRef &name) {
+  auto name_ref = alloc_header_name(balloc_, name);
+  auto token = http2::lookup_token(name_ref);
+  add_header_token(name_ref, StringRef{}, false, token);
+}
+
 void FieldStore::append_last_header_key(const char *data, size_t len) {
   shrpx::append_last_header_key(balloc_, header_key_prev_, buffer_size_,
                                 headers_, data, len);
@@ -456,6 +475,12 @@ void FieldStore::add_trailer_token(const StringRef &name,
   // fields combined.
   shrpx::add_header(trailer_key_prev_, buffer_size_, trailers_, name, value,
                     no_index, token);
+}
+
+void FieldStore::alloc_add_trailer_name(const StringRef &name) {
+  auto name_ref = alloc_header_name(balloc_, name);
+  auto token = http2::lookup_token(name_ref);
+  add_trailer_token(name_ref, StringRef{}, false, token);
 }
 
 void FieldStore::append_last_trailer_key(const char *data, size_t len) {
@@ -500,12 +525,21 @@ bool Downstream::get_chunked_request() const { return chunked_request_; }
 void Downstream::set_chunked_request(bool f) { chunked_request_ = f; }
 
 bool Downstream::request_buf_full() {
-  if (dconn_) {
-    return request_buf_.rleft() >=
-           get_config()->conn.downstream.request_buffer_size;
-  } else {
+  auto handler = upstream_->get_client_handler();
+  auto faddr = handler->get_upstream_addr();
+  auto worker = handler->get_worker();
+
+  // We don't check buffer size here for API endpoint.
+  if (faddr->alt_mode == ALTMODE_API) {
     return false;
   }
+
+  if (dconn_) {
+    auto &downstreamconf = *worker->get_downstream_config();
+    return request_buf_.rleft() >= downstreamconf.request_buffer_size;
+  }
+
+  return false;
 }
 
 DefaultMemchunks *Downstream::get_request_buf() { return &request_buf_; }
@@ -521,13 +555,14 @@ int Downstream::push_request_headers() {
 }
 
 int Downstream::push_upload_data_chunk(const uint8_t *data, size_t datalen) {
+  req_.recv_body_length += datalen;
+
   // Assumes that request headers have already been pushed to output
   // buffer using push_request_headers().
   if (!dconn_) {
     DLOG(INFO, this) << "dconn_ is NULL";
     return -1;
   }
-  req_.recv_body_length += datalen;
   if (dconn_->push_upload_data_chunk(data, datalen) != 0) {
     return -1;
   }
@@ -593,11 +628,14 @@ DefaultMemchunks *Downstream::get_response_buf() { return &response_buf_; }
 
 bool Downstream::response_buf_full() {
   if (dconn_) {
-    return response_buf_.rleft() >=
-           get_config()->conn.downstream.response_buffer_size;
-  } else {
-    return false;
+    auto handler = upstream_->get_client_handler();
+    auto worker = handler->get_worker();
+    auto &downstreamconf = *worker->get_downstream_config();
+
+    return response_buf_.rleft() >= downstreamconf.response_buffer_size;
   }
+
+  return false;
 }
 
 bool Downstream::validate_request_recv_body_length() const {
@@ -740,7 +778,15 @@ bool Downstream::get_expect_final_response() const {
 }
 
 bool Downstream::expect_response_body() const {
-  return http2::expect_response_body(req_.method, resp_.http_status);
+  return !resp_.headers_only &&
+         http2::expect_response_body(req_.method, resp_.http_status);
+}
+
+bool Downstream::expect_response_trailer() const {
+  // In HTTP/2, if final response HEADERS does not bear END_STREAM it
+  // is possible trailer fields might come, regardless of request
+  // method or status code.
+  return !resp_.headers_only && resp_.http_major == 2;
 }
 
 namespace {
@@ -863,7 +909,7 @@ bool Downstream::accesslog_ready() const { return resp_.http_status > 0; }
 
 void Downstream::add_retry() { ++num_retry_; }
 
-bool Downstream::no_more_retry() const { return num_retry_ > 5; }
+bool Downstream::no_more_retry() const { return num_retry_ > 50; }
 
 void Downstream::set_request_downstream_host(const StringRef &host) {
   request_downstream_host_ = host;
@@ -873,10 +919,13 @@ void Downstream::set_request_pending(bool f) { request_pending_ = f; }
 
 bool Downstream::get_request_pending() const { return request_pending_; }
 
+void Downstream::set_request_header_sent(bool f) { request_header_sent_ = f; }
+
 bool Downstream::request_submission_ready() const {
   return (request_state_ == Downstream::HEADER_COMPLETE ||
           request_state_ == Downstream::MSG_COMPLETE) &&
-         request_pending_ && response_state_ == Downstream::INITIAL;
+         (request_pending_ || !request_header_sent_) &&
+         response_state_ == Downstream::INITIAL;
 }
 
 int Downstream::get_dispatch_state() const { return dispatch_state_; }
@@ -897,9 +946,12 @@ BlockedLink *Downstream::detach_blocked_link() {
 }
 
 bool Downstream::can_detach_downstream_connection() const {
+  // We should check request and response buffer.  If request buffer
+  // is not empty, then we might leave downstream connection in weird
+  // state, especially for HTTP/1.1
   return dconn_ && response_state_ == Downstream::MSG_COMPLETE &&
          request_state_ == Downstream::MSG_COMPLETE && !upgraded_ &&
-         !resp_.connection_close;
+         !resp_.connection_close && request_buf_.rleft() == 0;
 }
 
 DefaultMemchunks Downstream::pop_response_buf() {
@@ -918,5 +970,14 @@ void Downstream::add_rcbuf(nghttp2_rcbuf *rcbuf) {
   nghttp2_rcbuf_incref(rcbuf);
   rcbufs_.push_back(rcbuf);
 }
+
+void Downstream::set_downstream_addr_group(
+    const std::shared_ptr<DownstreamAddrGroup> &group) {
+  group_ = group;
+}
+
+void Downstream::set_addr(const DownstreamAddr *addr) { addr_ = addr; }
+
+const DownstreamAddr *Downstream::get_addr() const { return addr_; }
 
 } // namespace shrpx

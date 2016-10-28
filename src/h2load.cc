@@ -92,6 +92,8 @@ Config::Config()
       conn_active_timeout(0.),
       conn_inactivity_timeout(0.),
       no_tls_proto(PROTO_HTTP2),
+      header_table_size(4_k),
+      encoder_header_table_size(4_k),
       data_fd(-1),
       port(0),
       default_port(0),
@@ -101,10 +103,12 @@ Config::Config()
       unix_addr{} {}
 
 Config::~Config() {
-  if (base_uri_unix) {
-    delete addrs;
-  } else {
-    freeaddrinfo(addrs);
+  if (addrs) {
+    if (base_uri_unix) {
+      delete addrs;
+    } else {
+      freeaddrinfo(addrs);
+    }
   }
 
   if (data_fd != -1) {
@@ -267,7 +271,7 @@ bool check_stop_client_request_timeout(Client *client, ev_timer *w) {
   auto nreq = client->req_todo - client->req_started;
 
   if (nreq == 0 ||
-      client->streams.size() >= (size_t)config.max_concurrent_streams) {
+      client->streams.size() >= client->session->max_concurrent_streams()) {
     // no more requests to make, stop timer
     ev_timer_stop(client->worker->loop, w);
     return true;
@@ -316,7 +320,8 @@ void client_request_timeout_cb(struct ev_loop *loop, ev_timer *w, int revents) {
 } // namespace
 
 Client::Client(uint32_t id, Worker *worker, size_t req_todo)
-    : cstat{},
+    : wb(&worker->mcpool),
+      cstat{},
       worker(worker),
       ssl(nullptr),
       next_addr(config.addrs),
@@ -328,7 +333,8 @@ Client::Client(uint32_t id, Worker *worker, size_t req_todo)
       req_done(0),
       id(id),
       fd(-1),
-      new_connection_requested(false) {
+      new_connection_requested(false),
+      final(false) {
   ev_io_init(&wev, writecb, 0, EV_WRITE);
   ev_io_init(&rev, readcb, 0, EV_READ);
 
@@ -516,6 +522,8 @@ void Client::disconnect() {
     close(fd);
     fd = -1;
   }
+
+  final = false;
 }
 
 int Client::submit_request() {
@@ -858,7 +866,7 @@ int Client::connection_made() {
 
   if (!config.timing_script) {
     auto nreq =
-        std::min(req_todo - req_started, (size_t)config.max_concurrent_streams);
+        std::min(req_todo - req_started, session->max_concurrent_streams());
     for (; nreq > 0; --nreq) {
       if (submit_request() != 0) {
         process_request_failure();
@@ -905,6 +913,10 @@ int Client::on_read(const uint8_t *data, size_t len) {
 }
 
 int Client::on_write() {
+  if (wb.rleft() >= BACKOFF_WRITE_BUFFER_THRES) {
+    return 0;
+  }
+
   if (session->on_write() != 0) {
     return -1;
   }
@@ -938,28 +950,32 @@ int Client::read_clear() {
 }
 
 int Client::write_clear() {
+  std::array<struct iovec, 2> iov;
+
   for (;;) {
-    if (wb.rleft() > 0) {
-      ssize_t nwrite;
-      while ((nwrite = write(fd, wb.pos, wb.rleft())) == -1 && errno == EINTR)
-        ;
-      if (nwrite == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          ev_io_start(worker->loop, &wev);
-          return 0;
-        }
-        return -1;
-      }
-      wb.drain(nwrite);
-      continue;
-    }
-    wb.reset();
     if (on_write() != 0) {
       return -1;
     }
-    if (wb.rleft() == 0) {
+
+    auto iovcnt = wb.riovec(iov.data(), iov.size());
+
+    if (iovcnt == 0) {
       break;
     }
+
+    ssize_t nwrite;
+    while ((nwrite = writev(fd, iov.data(), iovcnt)) == -1 && errno == EINTR)
+      ;
+
+    if (nwrite == -1) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        ev_io_start(worker->loop, &wev);
+        return 0;
+      }
+      return -1;
+    }
+
+    wb.drain(nwrite);
   }
 
   ev_io_stop(worker->loop, &wev);
@@ -1052,35 +1068,36 @@ int Client::read_tls() {
 int Client::write_tls() {
   ERR_clear_error();
 
+  struct iovec iov;
+
   for (;;) {
-    if (wb.rleft() > 0) {
-      auto rv = SSL_write(ssl, wb.pos, wb.rleft());
-
-      if (rv <= 0) {
-        auto err = SSL_get_error(ssl, rv);
-        switch (err) {
-        case SSL_ERROR_WANT_READ:
-          // renegotiation started
-          return -1;
-        case SSL_ERROR_WANT_WRITE:
-          ev_io_start(worker->loop, &wev);
-          return 0;
-        default:
-          return -1;
-        }
-      }
-
-      wb.drain(rv);
-
-      continue;
-    }
-    wb.reset();
     if (on_write() != 0) {
       return -1;
     }
-    if (wb.rleft() == 0) {
+
+    auto iovcnt = wb.riovec(&iov, 1);
+
+    if (iovcnt == 0) {
       break;
     }
+
+    auto rv = SSL_write(ssl, iov.iov_base, iov.iov_len);
+
+    if (rv <= 0) {
+      auto err = SSL_get_error(ssl, rv);
+      switch (err) {
+      case SSL_ERROR_WANT_READ:
+        // renegotiation started
+        return -1;
+      case SSL_ERROR_WANT_WRITE:
+        ev_io_start(worker->loop, &wev);
+        return 0;
+      default:
+        return -1;
+      }
+    }
+
+    wb.drain(rv);
   }
 
   ev_io_stop(worker->loop, &wev);
@@ -1134,10 +1151,20 @@ void Client::signal_write() { ev_io_start(worker->loop, &wev); }
 
 void Client::try_new_connection() { new_connection_requested = true; }
 
+namespace {
+int get_ev_loop_flags() {
+  if (ev_supported_backends() & ~ev_recommended_backends() & EVBACKEND_KQUEUE) {
+    return ev_recommended_backends() | EVBACKEND_KQUEUE;
+  }
+
+  return 0;
+}
+} // namespace
+
 Worker::Worker(uint32_t id, SSL_CTX *ssl_ctx, size_t req_todo, size_t nclients,
                size_t rate, size_t max_samples, Config *config)
     : stats(req_todo, nclients),
-      loop(ev_loop_new(0)),
+      loop(ev_loop_new(get_ev_loop_flags())),
       ssl_ctx(ssl_ctx),
       config(config),
       id(id),
@@ -1312,7 +1339,8 @@ process_time_stats(const std::vector<std::unique_ptr<Worker>> &workers) {
       }
       request_times.push_back(
           std::chrono::duration_cast<std::chrono::duration<double>>(
-              req_stat.stream_close_time - req_stat.request_time).count());
+              req_stat.stream_close_time - req_stat.request_time)
+              .count());
     }
 
     const auto &stat = w->stats;
@@ -1321,7 +1349,8 @@ process_time_stats(const std::vector<std::unique_ptr<Worker>> &workers) {
       if (recorded(cstat.client_start_time) &&
           recorded(cstat.client_end_time)) {
         auto t = std::chrono::duration_cast<std::chrono::duration<double>>(
-                     cstat.client_end_time - cstat.client_start_time).count();
+                     cstat.client_end_time - cstat.client_start_time)
+                     .count();
         if (t > 1e-9) {
           rps_values.push_back(cstat.req_success / t);
         }
@@ -1335,7 +1364,8 @@ process_time_stats(const std::vector<std::unique_ptr<Worker>> &workers) {
 
       connect_times.push_back(
           std::chrono::duration_cast<std::chrono::duration<double>>(
-              cstat.connect_time - cstat.connect_start_time).count());
+              cstat.connect_time - cstat.connect_start_time)
+              .count());
 
       if (!recorded(cstat.ttfb)) {
         continue;
@@ -1343,7 +1373,8 @@ process_time_stats(const std::vector<std::unique_ptr<Worker>> &workers) {
 
       ttfb_times.push_back(
           std::chrono::duration_cast<std::chrono::duration<double>>(
-              cstat.ttfb - cstat.connect_start_time).count());
+              cstat.ttfb - cstat.connect_start_time)
+              .count());
     }
   }
 
@@ -1561,6 +1592,27 @@ std::unique_ptr<Worker> create_worker(uint32_t id, SSL_CTX *ssl_ctx,
 } // namespace
 
 namespace {
+int parse_header_table_size(uint32_t &dst, const char *opt,
+                            const char *optarg) {
+  auto n = util::parse_uint_with_unit(optarg);
+  if (n == -1) {
+    std::cerr << "--" << opt << ": Bad option value: " << optarg << std::endl;
+    return -1;
+  }
+  if (n > std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "--" << opt
+              << ": Value too large.  It should be less than or equal to "
+              << std::numeric_limits<uint32_t>::max() << std::endl;
+    return -1;
+  }
+
+  dst = n;
+
+  return 0;
+}
+} // namespace
+
+namespace {
 void print_version(std::ostream &out) {
   out << "h2load nghttp2/" NGHTTP2_VERSION << std::endl;
 }
@@ -1569,7 +1621,8 @@ void print_version(std::ostream &out) {
 namespace {
 void print_usage(std::ostream &out) {
   out << R"(Usage: h2load [OPTIONS]... [URI]...
-benchmarking tool for HTTP/2 and SPDY server)" << std::endl;
+benchmarking tool for HTTP/2 and SPDY server)"
+      << std::endl;
 }
 } // namespace
 
@@ -1601,14 +1654,17 @@ Options:
               with --timing-script-file option,  this option specifies
               the number of requests  each client performs rather than
               the number of requests across all clients.
-              Default: )" << config.nreqs << R"(
+              Default: )"
+      << config.nreqs << R"(
   -c, --clients=<N>
               Number  of concurrent  clients.   With  -r option,  this
               specifies the maximum number of connections to be made.
-              Default: )" << config.nclients << R"(
+              Default: )"
+      << config.nclients << R"(
   -t, --threads=<N>
               Number of native threads.
-              Default: )" << config.nthreads << R"(
+              Default: )"
+      << config.nthreads << R"(
   -i, --input-file=<PATH>
               Path of a file with multiple URIs are separated by EOLs.
               This option will disable URIs getting from command-line.
@@ -1627,13 +1683,15 @@ Options:
   -w, --window-bits=<N>
               Sets the stream level initial window size to (2**<N>)-1.
               For SPDY, 2**<N> is used instead.
-              Default: )" << config.window_bits << R"(
+              Default: )"
+      << config.window_bits << R"(
   -W, --connection-window-bits=<N>
               Sets  the  connection  level   initial  window  size  to
               (2**<N>)-1.  For SPDY, if <N>  is strictly less than 16,
               this option  is ignored.   Otherwise 2**<N> is  used for
               SPDY.
-              Default: )" << config.connection_window_bits << R"(
+              Default: )"
+      << config.connection_window_bits << R"(
   -H, --header=<HEADER>
               Add/Override a header to the requests.
   --ciphers=<SUITE>
@@ -1651,11 +1709,15 @@ Options:
               Available protocols: )";
 #endif // !HAVE_SPDYLAY
   out << NGHTTP2_CLEARTEXT_PROTO_VERSION_ID << R"( and
-              )" << NGHTTP2_H1_1 << R"(
-              Default: )" << NGHTTP2_CLEARTEXT_PROTO_VERSION_ID << R"(
+              )"
+      << NGHTTP2_H1_1 << R"(
+              Default: )"
+      << NGHTTP2_CLEARTEXT_PROTO_VERSION_ID << R"(
   -d, --data=<PATH>
               Post FILE to  server.  The request method  is changed to
-              POST.
+              POST.   For  http/1.1 connection,  if  -d  is used,  the
+              maximum number of in-flight pipelined requests is set to
+              1.
   -r, --rate=<N>
               Specifies  the  fixed  rate  at  which  connections  are
               created.   The   rate  must   be  a   positive  integer,
@@ -1724,10 +1786,22 @@ Options:
               NPN.  The parameter must be  delimited by a single comma
               only  and any  white spaces  are  treated as  a part  of
               protocol string.
-              Default: )" << DEFAULT_NPN_LIST << R"(
+              Default: )"
+      << DEFAULT_NPN_LIST << R"(
   --h1        Short        hand         for        --npn-list=http/1.1
               --no-tls-proto=http/1.1,    which   effectively    force
               http/1.1 for both http and https URI.
+  --header-table-size=<SIZE>
+              Specify decoder header table size.
+              Default: )"
+      << util::utos_unit(config.header_table_size) << R"(
+  --encoder-header-table-size=<SIZE>
+              Specify encoder header table size.  The decoder (server)
+              specifies  the maximum  dynamic table  size it  accepts.
+              Then the negotiated dynamic table size is the minimum of
+              this option value and the value which server specified.
+              Default: )"
+      << util::utos_unit(config.encoder_header_table_size) << R"(
   -v, --verbose
               Output debug information.
   --version   Display version information and exit.
@@ -1735,10 +1809,14 @@ Options:
 
 --
 
+  The <SIZE> argument is an integer and an optional unit (e.g., 10K is
+  10 * 1024).  Units are K, M and G (powers of 1024).
+
   The <DURATION> argument is an integer and an optional unit (e.g., 1s
   is 1 second and 500ms is 500 milliseconds).  Units are h, m, s or ms
   (hours, minutes, seconds and milliseconds, respectively).  If a unit
-  is omitted, a second is used as unit.)" << std::endl;
+  is omitted, a second is used as unit.)"
+      << std::endl;
 }
 } // namespace
 
@@ -1776,6 +1854,8 @@ int main(int argc, char **argv) {
         {"npn-list", required_argument, &flag, 4},
         {"rate-period", required_argument, &flag, 5},
         {"h1", no_argument, &flag, 6},
+        {"header-table-size", required_argument, &flag, 7},
+        {"encoder-header-table-size", required_argument, &flag, 8},
         {nullptr, 0, nullptr, 0}};
     int option_index = 0;
     auto c = getopt_long(argc, argv, "hvW:c:d:m:n:p:t:w:H:i:r:T:N:B:",
@@ -1976,6 +2056,20 @@ int main(int argc, char **argv) {
             util::parse_config_str_list(StringRef::from_lit("http/1.1"));
         config.no_tls_proto = Config::PROTO_HTTP1_1;
         break;
+      case 7:
+        // --header-table-size
+        if (parse_header_table_size(config.header_table_size,
+                                    "header-table-size", optarg) != 0) {
+          exit(EXIT_FAILURE);
+        }
+        break;
+      case 8:
+        // --encoder-header-table-size
+        if (parse_header_table_size(config.encoder_header_table_size,
+                                    "encoder-header-table-size", optarg) != 0) {
+          exit(EXIT_FAILURE);
+        }
+        break;
       }
       break;
     default:
@@ -2043,7 +2137,8 @@ int main(int argc, char **argv) {
         if (config.nreqs > uris.size()) {
           std::cerr << "-n: the number of requests must be less than or equal "
                        "to the number of timing script entries. Setting number "
-                       "of requests to " << uris.size() << std::endl;
+                       "of requests to "
+                    << uris.size() << std::endl;
 
           config.nreqs = uris.size();
         }
@@ -2093,7 +2188,8 @@ int main(int argc, char **argv) {
 
   if (config.nclients < config.nthreads) {
     std::cerr << "-c, -t: the number of clients must be greater than or equal "
-                 "to the number of threads." << std::endl;
+                 "to the number of threads."
+              << std::endl;
     exit(EXIT_FAILURE);
   }
 
@@ -2106,7 +2202,8 @@ int main(int argc, char **argv) {
 
     if (config.rate > config.nclients) {
       std::cerr << "-r, -c: the connection rate must be smaller than or equal "
-                   "to the number of clients." << std::endl;
+                   "to the number of clients."
+                << std::endl;
       exit(EXIT_FAILURE);
     }
   }
@@ -2202,6 +2299,11 @@ int main(int argc, char **argv) {
     }
   }
 
+  std::string content_length_str;
+  if (config.data_fd != -1) {
+    content_length_str = util::utos(config.data_length);
+  }
+
   auto method_it =
       std::find_if(std::begin(shared_nva), std::end(shared_nva),
                    [](const Header &nv) { return nv.name == ":method"; });
@@ -2232,14 +2334,20 @@ int main(int argc, char **argv) {
       h1req += nv.value;
       h1req += "\r\n";
     }
+
+    if (!content_length_str.empty()) {
+      h1req += "Content-Length: ";
+      h1req += content_length_str;
+      h1req += "\r\n";
+    }
     h1req += "\r\n";
 
     config.h1reqs.push_back(std::move(h1req));
 
     // For nghttp2
     std::vector<nghttp2_nv> nva;
-    // 1 for :path
-    nva.reserve(1 + shared_nva.size());
+    // 2 for :path, and possible content-length
+    nva.reserve(2 + shared_nva.size());
 
     nva.push_back(http2::make_nv_ls(":path", req));
 
@@ -2247,12 +2355,18 @@ int main(int argc, char **argv) {
       nva.push_back(http2::make_nv(nv.name, nv.value, false));
     }
 
+    if (!content_length_str.empty()) {
+      nva.push_back(http2::make_nv(StringRef::from_lit("content-length"),
+                                   StringRef{content_length_str}));
+    }
+
     config.nva.push_back(std::move(nva));
 
     // For spdylay
     std::vector<const char *> cva;
-    // 2 for :path and :version, 1 for terminal nullptr
-    cva.reserve(2 * (2 + shared_nva.size()) + 1);
+    // 3 for :path, :version, and possible content-length, 1 for
+    // terminal nullptr
+    cva.reserve(2 * (3 + shared_nva.size()) + 1);
 
     cva.push_back(":path");
     cva.push_back(req.c_str());
@@ -2267,6 +2381,12 @@ int main(int argc, char **argv) {
     }
     cva.push_back(":version");
     cva.push_back("HTTP/1.1");
+
+    if (!content_length_str.empty()) {
+      cva.push_back("content-length");
+      cva.push_back(content_length_str.c_str());
+    }
+
     cva.push_back(nullptr);
 
     config.nv.push_back(std::move(cva));
@@ -2430,26 +2550,29 @@ int main(int argc, char **argv) {
   }
 
   std::cout << std::fixed << std::setprecision(2) << R"(
-finished in )" << util::format_duration(duration) << ", " << rps << " req/s, "
+finished in )"
+            << util::format_duration(duration) << ", " << rps << " req/s, "
             << util::utos_funit(bps) << R"(B/s
-requests: )" << stats.req_todo << " total, " << stats.req_started
-            << " started, " << stats.req_done << " done, "
-            << stats.req_status_success << " succeeded, " << stats.req_failed
-            << " failed, " << stats.req_error << " errored, "
-            << stats.req_timedout << R"( timeout
-status codes: )" << stats.status[2] << " 2xx, " << stats.status[3] << " 3xx, "
+requests: )" << stats.req_todo
+            << " total, " << stats.req_started << " started, " << stats.req_done
+            << " done, " << stats.req_status_success << " succeeded, "
+            << stats.req_failed << " failed, " << stats.req_error
+            << " errored, " << stats.req_timedout << R"( timeout
+status codes: )"
+            << stats.status[2] << " 2xx, " << stats.status[3] << " 3xx, "
             << stats.status[4] << " 4xx, " << stats.status[5] << R"( 5xx
-traffic: )" << util::utos_funit(stats.bytes_total) << "B (" << stats.bytes_total
-            << ") total, " << util::utos_funit(stats.bytes_head) << "B ("
-            << stats.bytes_head << ") headers (space savings "
-            << header_space_savings * 100 << "%), "
-            << util::utos_funit(stats.bytes_body) << "B (" << stats.bytes_body
-            << R"() data
+traffic: )" << util::utos_funit(stats.bytes_total)
+            << "B (" << stats.bytes_total << ") total, "
+            << util::utos_funit(stats.bytes_head) << "B (" << stats.bytes_head
+            << ") headers (space savings " << header_space_savings * 100
+            << "%), " << util::utos_funit(stats.bytes_body) << "B ("
+            << stats.bytes_body << R"() data
                      min         max         mean         sd        +/- sd
-time for request: )" << std::setw(10) << util::format_duration(ts.request.min)
-            << "  " << std::setw(10) << util::format_duration(ts.request.max)
-            << "  " << std::setw(10) << util::format_duration(ts.request.mean)
-            << "  " << std::setw(10) << util::format_duration(ts.request.sd)
+time for request: )"
+            << std::setw(10) << util::format_duration(ts.request.min) << "  "
+            << std::setw(10) << util::format_duration(ts.request.max) << "  "
+            << std::setw(10) << util::format_duration(ts.request.mean) << "  "
+            << std::setw(10) << util::format_duration(ts.request.sd)
             << std::setw(9) << util::dtos(ts.request.within_sd) << "%"
             << "\ntime for connect: " << std::setw(10)
             << util::format_duration(ts.connect.min) << "  " << std::setw(10)
