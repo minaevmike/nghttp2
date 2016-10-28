@@ -1,3 +1,593 @@
+nghttp2 (1.16.0-7) utopic; urgency=medium
+
+  [ Jacob Champion ]
+  * nghttp: add an --expect-continue option
+  * nghttp: implement Expect/Continue handshake
+  * nghttp: time out on long Expect/Continue waits
+  * nghttp: prevent ContinueTimer double-invocation
+
+  [ Tatsuhiro Tsujikawa ]
+  * src: Made strieq(T, S) template
+  * src: Make streq(T, S) function template
+  * src: Don't allow const char * in 2nd argument of strieq_l(S[N], T)
+  * src: Don't allow const char * in 2nd argument of streq_l(S[N], T)
+  * src: Make strifind functin template
+  * src: Don't allow const char * in iends_with and iends_with_l
+  * src: Don't allow const char * in ends_with and ends_with_l
+  * src: Don't allow const char * in istarts_with and istarts_with_l
+  * src: Don't allow const char * in starts_with
+  * src: Remove lookup_token(const std::string&)
+  * src: Remove lookup_method_token(const std::string&)
+  * src: parse_link_header takes StringRef
+  * Update doc
+  * Update doc
+  * Update github links
+  * Update doc
+  * Update doc
+  * Update AUTHORS
+  * Bump up version number to 1.9.0, LT revision to 20:0:6
+  * Update man pages
+  * Update bash_completion
+  * Bump up version number to 1.10.0-DEV
+  * src: Use len instead of n for clarity
+  * nghttpx: Fix handing stream after connection check was failed
+  * nghttpx: Don't use data_prd.source.ptr
+  * nghttpx: Fix bug that backend tls keyword did not work with -s option
+  * Bump up version number to 1.9.1
+  * Update man pages
+  * Bump up version number to 1.10.0-DEV
+  * nghttpx: Fix bug that proxy with HTTP/1.1 CONNECT did not work
+  * nghttpx: Fix bug that logger wrote string which was not NULL-terminated
+
+  [ Jacob Champion ]
+  * nghttp: move ContinueTimer start to on_frame_send
+
+  [ Jianqing Wang ]
+  * Fix error messages on deprecated mode
+
+  [ Tatsuhiro Tsujikawa ]
+  * nghttpx: One more fix for usage help
+  * clang-format
+  * Don't send WINDOW_UPDATE if session is being closed
+
+  [ Jacob Champion ]
+  * nghttp: stop ContinueTimers on response or reset
+  * nghttp: move ownership of ContinueTimer to Request
+  * nghttp: only stop ContinueTimers if they exist
+
+  [ Tatsuhiro Tsujikawa ]
+  * clang-format
+  * nghttpx: Better distribute load to backend h2 servers
+  * Run error callback when peer does not send initial SETTINGS frame
+  * nghttpx: Fix crash with backend failure
+  * Update authors
+  * nghttpx: Better load balancing between backend HTTP/2 servers
+  * nghttpx: Use gRPC's exponential backoff algorithm
+  * nghttpx: Set 0 to next_proto_len explicitly for clarification
+  * nghttpx: Refactor handling of negotiated ALPN
+  * nghttpx: Detect online/offline state of backend servers
+  * nghttpx: Add --backend-fall and --backend-rise options
+  * nghttpx: Use exponential backoff between failed connection attempts in LiveCheck
+  * nghttpx: Remove unused function declaration
+  * nghttpx: Check negotiated ALPN in LiveCheck
+  * src: Add missing source file to CMakeLists.txt
+  * altsvc: Add ALTSVC frame support
+  * altsvc: Add error handling about origin and stream_id
+  * src: Log ALTSVC
+  * altsvc: Add tx tests
+  * altsvc: Receive ALTSVC frame
+  * Embed nghttp2_ext_frame_payload into nghttp2_outbound_item
+  * Assign nghttp2_frame.ext.payload early
+  * altsvc: Discard altsvc when it is received by server in earlier point
+  * altsvc: Reduce bitfield size
+  * altsvc: Add tests, ignore altsvc if stream does not exist
+  * altsvc: Update doc
+  * Fix compile error with gcc and --enable-werror
+  * doc: Add missing rst files for cleaning
+  * nghttpx: Move fall/rise configuration to --backend option
+  * Fix compile error (again) with gcc and --enable-werror
+  * Add test for altsvc frame
+  * Pass unknown SETTINGS values to nghttp2_on_frame_recv_callback
+  * Update man pages
+  * Update bash_completion
+  * nghttpx: Enable link header field based push for non-final response
+  * Update doc
+  * Update sphinx_rtd_theme
+  * Update http-parser
+  * nghttpx: Retry next HTTP/2 backend address when connection cannot be made
+  * nghttpx: Try next HTTP/1 backend address when connection cannot be made
+  * nghttpx: Error handling without assert
+  * Don't send ALTSVC if stream is closing
+  * nghttpx: Fix bug that server push from mruby script did not work
+  * Update doc
+  * Update doc
+  * Update man pages
+  * nghttpx: Log when backend group is shared
+  * nghttpx: Truncate too long -b option signature
+  * nghttpx: Remove trailing "." from SAN DNS name and CN
+  * nghttpx: Wildcard match for CN
+  * nghttp: Use nghttp2_session_mem_recv
+
+  [ Mike Conlen ]
+  * in nghttp2_session_send() data is declared uninitialized and used after a call to nghttp2_session_mem_send_internal() which should set it, however in nghttp2_session_mem_send_internal() it is possible to return before setting the pointer.
+
+  [ Tatsuhiro Tsujikawa ]
+  * Zero fill in nghttp2_session_mem_send
+  * Mention the removal of --backend-http2-connections-per-worker in migration guide
+  * nghttpx: Workaround for some older gcc4.9
+  * Disable integration tests due to golang build failure
+  * src: Handle return value of getsockopt
+  * clang-format
+  * nghttpx: Fix erroneous division by sizeof(...)
+  * Update AUTHORS
+
+  [ Brian Suh ]
+  * nghttpx: Fix downstream connect callback called early
+
+  [ Tatsuhiro Tsujikawa ]
+  * Update AUTHORS
+  * Update man pages
+  * Bump up version number to 1.10.0, LT revision to 21:0:7
+  * Update man pages
+  * Bump up version number to 1.11.0-DEV
+  * Update releasechk
+  * integration: Workaround runtime error: cgo argument has Go pointer to Go pointer
+  * nghttpx: Don't use CN if we have dNSName or iPAddress field
+  * nghttpx: Don't add 0-length DATA when response HEADERS bears END_STREAM flag
+  * Avoid 0-length DATA if NGHTTP2_DATA_FLAG_NO_END_STREAM is set
+  * nghttpx: Always expect response trailer fields
+  * nghttpx: Add mruby env.server_port to return frontend server side port
+  * nghttpx: Destroy SSL object, and always lookup TLS session cache
+  * nghttpx: Enable TLS session cache again in memcached connection
+  * nghttpx: Add mruby env.server_addr and env.tls_used attributes
+  * nghttpx: Add sni keyword to --backend option
+  * Update doc
+  * nghttpx: Use parameter instead of keyword for consistency
+  * Update man pages
+  * ngttpx: Pass environ to execve
+  * nghttpx: Just call execv instead of execve
+  * Fix bug that PING flags are ignored in nghttp2_submit_ping
+  * nghttpx: Enable kqueue by default
+  * h2load: Fix crash on exit on FreeBSD
+  * h2load: Enable kqueue if it is available in the running platform
+  * nghttpd: Enable kqueue if it is available on the running platform
+  * src: Compile with OpenSSL 1.1.0-pre5
+  * nghttp: Eliminate zero length DATA frame at the end if possible
+  * nghttp: More robust error handling while reading file
+  * h2load: Robust error handling in POST data
+  * Refactor map remove
+  * nghttpx: Don't keep backend connection if request buffer is not empty
+  * nghttpx: Use NGHTTP2_DATA_FLAG_NO_COPY for backend HTTP/2 session
+  * nghttpd: Set content-length in status response
+  * nghttpx: Don't add chunked encoded response body for HEAD request
+  * Add nghttp2_hd_inflate_hd2() and deprecate nghttp2_hd_inflate_hd()
+  * nghttpx: Refactor
+  * nghttpx: Add connection: close to mruby response in graceful shutdown period
+  * Fix typo
+  * nghttpx: Treat backend failure if SETTINGS is not received within timeout
+  * nghttpx: Wait for SETTINGS ACK to make sure that backend h2 server is alive
+  * nghttpx: Don't re-enter offline if it is already in offline mode
+  * nghttpx: Don't restart SETTINGS timer, and fix log message in HTTP/2 frontend
+  * nghttpx: Call downstream_failure where it should be
+  * nghttpx: Call downstream_failure rather than on_failure in HTTP/1 backend
+  * nghttpx: Save PID file after it is ready to accept connections
+  * nghttpx: No need to check activeness of SETTINGS ACK timer
+  * nghttpx: Handle corner case where session is going down just after ACK recved
+  * nghttpx: Use ev_timer_start intead of ev_timer_again for settings_timer_
+  * nghttpx: Make SETTINGS timeout value configurable
+  * Update man pages
+  * Update bash_completion
+  * nghttpx: Check null just in case
+  * nghttpx: Write PID in temporary file then rename
+  * nghttpx: Fix crash introduced in the previous commit
+  * nghttpx: Cleane up bit more of save_pid()
+  * nghttpx: Make backend fail if connect operation was timed out
+  * nghttpx: Make backend fail if connect attempt is timed out
+  * nghttpx: Allow mixed protocol and TLS settings among backends under same pattern
+  * nghttpx: Refactor protocol selection in backend
+  * nghttpx: Fix bug that h2 is used while there is no h2 backend
+  * nghttpx: Fix bug that 503 is returned if backend proto is not mixed
+  * Bump up version number to 1.11.0, LT revision to 22:0:8
+  * Update man pages
+  * Bump up version number to 1.12.0-DEV
+  * Update http-parser to f2c26ee500ab3921010fa7ec66243365611e77dd
+  * nghttpx: Cleanup code where request content-length is involved
+  * nghttpx: Fix compile error with gcc
+  * nghttpx: Fix bug that timeout on h1 backend makes that backend unavailable
+  * nghttpx: Remove unused private field from Connection object
+  * Add nghttp2_session_set_local_window_size() API function
+  * src: Use nghttp2_session_set_local_window_size()
+  * Add missing rst file
+  * src: Fix compiler warnings
+
+  [ Alexis La Goutte ]
+  * fix warning: declaration of 'free' shadows a global declaration
+
+  [ Tatsuhiro Tsujikawa ]
+  * nghttpx: Add api parameter to --frontend option to mark API endpoint
+  * nghttpx: Add APIDownstreamConnection to handle API request
+  * nghttpx: Pass pointer to Config object to store parsed configurations
+  * nghttpx: Share the code to configure backends
+  * nghttpx: Use std::shared_ptr for downstream addresses so that we can swap them
+  * nghttpx: Share downstream config object
+  * nghttpx: Retain memory in Router
+  * nghttpx: Send notice to replace downstream via ConnectionHandler
+  * nghttpx: Close and disallow h1 backend connection on backend replacement
+  * nghttpx: Send GOAWAY for retired h2 backend connection
+  * nghttpx: Remove flow_control_ from Http2Session
+  * nghttpx: Refactor graceful shutdown in Http2Upstream
+  * nghttpx: Rename BlockAllocator::destroy as BlockAllocator::reset
+  * nghttpx: Avoid copy
+  * nghttpx: Send 100-continue for API request
+  * nghttpx: Fix typo
+  * nghttpx: Add --api-max-request-body option to set maximum API request body size
+  * nghttpx: Only parse backend option for API request for now
+  * nghttpx: Close API request connection for 400 and 413 response
+  * nghttpx: Only allow POST and PUT for API request
+  * nghttpx: Use JSON for API resposne body
+  * nghttpx: Change API endpoint URI
+  * Add nghttpx API section
+  * nghttpx: Describe api parameter in --frontend option
+  * Update man pages
+  * Update bash_completion
+  * Update doc
+  * Update man pages
+  * Update doc
+  * Add integration tests for nghttpx API endpoint
+  * nghttpx: Close TODO comments
+  * nghttpx: Make API endpoint work with SPDY
+  * Add API integration tests with http/1.1 and SPDY
+  * nghttpx: Fix memory leak
+  * nghttpx: Implement client IP based session affinity
+  * nghttpx: Fix bugs and crash when affinity is enabled
+  * nghttpx: Erase wildcard patterns with http2 proxy enabled
+  * Update man pages
+  * nghttpx: Rewrite wildcard router
+  * nghttpx: Handle edge case wildcard pattern and add tests
+  * nghttpx: Aggregate router configuration into one struct
+  * nghttpx: Use BlockAllocator in match_downstream_addr_group
+  * h2load: Implement HTTP/1 upload
+  * h2load: Add content-length header field for HTTP/2 and SPDY as well
+  * h2load: Use memchunks
+  * h2load: http1: Send header + body in one packet
+  * h2load: Document the behaviour when -d is used with HTTP/1.1 connection
+  * nghttpx: Rename backend/replace API as backendconfig
+  * Update doc
+  * nghttpx: Allow query in API endpoint
+  * integration: Rename method names
+  * Update man pages
+  * Add nghttp2_option_set_max_send_header_block_length API function
+  * Fix typo
+  * nghttpx: Fix stack buffer overflow with API call
+  * nghttpx: Fix bug that backend never return to online
+  * nghttpx: Receive reference of std::mt19937, not making a copy
+  * nghttpx: Use dedicated worker for API processing
+  * nghttpx: Silence logging
+  * nghttpx: Fast backend replacement on multi thread environment
+  * nghttpx: Use AI_NUMERICSERV
+  * nghttpx: Make API processing one of alternative mode
+  * nghttpx: Add healthmon parameter to -f option to enable health monitor mode
+  * nghttpx: Move api enabled to APIConfig
+  * integration: Add tests for healthmon
+  * Update man pages
+  * nghttpx: Use 16KiB buffer for reading to match TLS record size
+  * nghttpx: Make backend fail with TLS handshake failure, including ALPN mismatch
+  * nghttpx: Handle error from push_upload_data and end_upload_data
+  * examples: Add ALPN support to tutorial client/server
+  * Update tutorials according to the updated tutorial client/server sources
+  * Robust handling for ssize_t on Win32 platform
+  * Rewrite session_append_inflight_settings
+  * Clarify code path when appending inflight_settings
+  * nghttpx: Enforce the fact that api and healthmon are mutually exclusive
+  * nghttpx: Add --backend-max-backoff option
+  * Revert "Robust handling for ssize_t on Win32 platform"
+  * Specify 1 for 2nd parameter of fwrite as a convention
+  * integration: Add tests for the case where response ends before request
+  * nghttpx: Clean up neverbleed AF_UNIX socket
+  * nghttpx: Rewrite read timer handling
+  * nghttpx: Don't reset read timer on write in memcached connection
+  * nghttpx: Don't reset read timer on write in LiveCheck
+  * nghttpx: Reduce TTFB with large number of incoming connections
+  * nghttpx: Rewrite CertLookupTree using Router
+  * nghttpx: Fix compile error with openssl 1.0.1
+  * nghttpx: Update doc
+  * nghttpx: Fix memory leak from CertLookupTree
+  * nghttpx: Fix compile error without --with-mruby
+  * nghttpx: Fix compile error with gcc
+  * nghttpx: Fix compile error with gcc -Werror=comment
+  * Update man pages
+  * Update bash_completion
+  * examples: Check return value from nghttp2_submit_settings
+  * Bump up version number to 1.12.0
+  * Update man pages
+  * nghttpx: Update doc
+  * Update man pages
+  * Bump up version number to 1.13.0-DEV
+  * nghttpx: Fix build error with libressl
+  * nghttpx: Cast to double to fix build with gcc 4.8 on Solaris 11
+  * nghttpx: Use faster version of power
+  * Cancel frame transmission from before_frame_send_callback
+  * Add test for canceling PUSH_PROMISE
+
+  [ Tomasz Buchert ]
+  * Fix FTBFS on armel by explicitly including the <mutex> header.
+
+  [ Tatsuhiro Tsujikawa ]
+  * nghttpx: Use consistent hashing for client IP based session affinity
+  * examples: Fix compile error with OpenSSL v1.1.0-beta2
+  * nghttpx: Explicitly cast to uint32_t for hash calculation
+  * Update doc
+  * nghttpx: Retry memcached connection
+  * Update doc
+  * Update doc
+  * Update doc
+  * doc: Fix Sphinx build warnings
+  * Update man pages
+  * Fix warning with Sphinx 1.4
+  * Work with Android NDK r12b
+  * Update doc
+  * Update doc
+  * Bump up version number to 1.13.0, LT revision to 23:0:9
+  * Update man pages
+  * Bump up version number to 1.14.0-DEV
+  * nghttp: Allow multiple -p option
+  * nghttp: next_weight_idx is enough to be an local variable
+  * Document about ALPN in nghttpx howto
+  * Output availability of ALPN in configure summary
+  * nghttpx: Do creation of InheritedAddr in a dedicated function for reuse
+  * nghttpx: Reload configuration with SIGHUP
+  * nghttpx: Rename SignalServer with WorkerProcess
+  * nghttpx: Remove last_worker_pid from Config
+  * nghttpx: Move original_argv, argv, argc, and cmdcfgs to StartupConfig
+  * nghttpx: Close fd when error occurred in reload operation
+  * nghttpx: Define ~Config for automatic clean up with std::unique_ptr
+  * nghttpx: Cleanup
+  * nghttpx: Don't exit from save_pid and set_alpn_prefs
+  * nghttpx: Update doc
+  * Update doc
+  * Update man pages
+  * Revert "Output availability of ALPN in configure summary"
+  * Call error callback when invalid header field is received and ignored
+  * Log frame's stream ID for header debug logging
+  * Add nghttp2_on_invalid_header_callback
+
+  [ Wenfeng Liu ]
+  * Make get_max_index() return the max index in frame, so we don't need to do extra calculation
+
+  [ Tatsuhiro Tsujikawa ]
+  * Fix wrong tree operation to avoid cycle
+  * nghttpx: Use copy instead of const reference of backend group
+  * nghttpx: Add access log variable for backend host and port
+
+  [ Wenfeng Liu ]
+  * 1. Modify genlibtokenlookup.py to remove redundant header comparisons. 2. Remove inline qualifier of lookup_token() in genlibtokenlookup.py.
+
+  [ Tatsuhiro Tsujikawa ]
+  * More strict stream state handling
+  * Search dynamic table first for optimization
+
+  [ Wenfeng Liu ]
+  * Use memeq() instead of lstreq() in lookup_token().
+
+  [ Tatsuhiro Tsujikawa ]
+  * Remove old doc about differential encoding in HPACK
+
+  [ Wenfeng Liu ]
+  * lib: since hd_inflate_commit_indexed() always return 0, remove the return value check in nghttp2_hd_inflate_hd_nv().
+
+  [ Tatsuhiro Tsujikawa ]
+  * Make result type of hd_inflate_commit_indexed void
+  * More doc about HPACK decoding API
+  * nghttp: Adjust weight according to Firefox stable
+
+  [ Wenfeng Liu ]
+  * lib: Add nghttp2_hd_deflate_hd_vec() deflate API to support multiple bufs input
+
+  [ Tatsuhiro Tsujikawa ]
+  * Make parameters const pointer
+  * Add test for nghttp2_hd_deflate_hd_vec
+  * Use pointer-to-pointer idiom to construct linked list
+
+  [ Wenfeng Liu ]
+  * lib: Malloc nghttp2_buf_chain array once in nghttp2_bufs_wrap_init2() to simplify logic
+
+  [ Tatsuhiro Tsujikawa ]
+  * Use whole chunk when performing huffman encoding
+  * Use nghttp2_vec in nghttp2_hd_deflate_hd_vec
+  * Remove bufs_avail
+  * Add test for nghttp2_hd_deflate_hd_vec with 1 byte chunk
+  * deflatehd: Call nghttp2_hd_deflate_change_table_size only if table size is changed from default
+  * Allow nonuniform buffer size in nghttp2_hd_deflate_hd_vec()
+  * Update doc
+  * nghttpx: Fix bug that api and healthmon params do not work with http2 proxy
+  * nghttpx: Guard with LOG_ENABLED(INFO)
+  * nghttpx: Log backend connection failure in WARN level
+  * nghttpx: Don't change pushed stream's priority
+  * Add License section in README
+  * Document how to report vulnerability
+  * Fix typo
+  * Add APIs to return the number of data that remote endpoint can send
+  * Add missing document entries
+  * Update doc
+  * Add nghttp2_session_get_local_settings() API function
+  * asio: Fix reserved size
+  * nghttpx: Set do_signal_write_ when TLS handshake was completed
+
+  [ Wenfeng Liu ]
+  * lib: Make emit_header() return void since it always succeed.
+
+  [ Tatsuhiro Tsujikawa ]
+  * nghttpx: Log error code from getsockopt(SO_ERROR) on first write event
+  * Update AUTHORS
+  * Add author.py
+  * Bump up version number to 1.14.0, LT revision to 24:0:10
+  * nghttpx: Disallow copying Config
+  * Update man pages
+  * doc: Add missing APIDOCS entry
+  * Bump up version number to 1.15.0-DEV
+  * nghttpx: Add --server-name option to change server response header field
+  * Make ImmutableString(const char*) explicit
+  * Make ImmutableString(const std::string&) explicit
+  * Add API to get current HPACK dynamic table size
+  * Fix compile error with openssl 1.1.0
+  * src: Only consider openssl 1.1.0 final
+  * Enable ASAN in travis autotools build
+  * python: Support ALPN, require Python 3.5
+  * Update doc
+  * nghttpx: Reset stream if invalid header field is received in h2
+  * Allow NGHTTP2_ERR_PAUSE from nghttp2_data_source_read_callback
+  * Add -lsocket -lnsl to APPLDFLAGS for solaris build
+  * nghttpx: Retry if backend h1 connection cannot be established due to timeout
+  * Add -Wsometimes-uninitialized to warn flags
+  * nghttpx: Add --no-server-rewrite option not to rewrite server header field
+  * nghttpx: Fix bug that bytes are doubly counted for TLS connections
+  * Update neverbleed
+  * nghttpx: Workaround for std::make_shared bug in Xcode7, 7.1, and 7.2
+  * Update neverbleed
+  * Fix GOAWAY race with new incoming stream on server side
+  * Bump up LT revision to 24:1:10 due to v1.14.1 release
+  * nghttpx: Add experimental TCP optimization for h2 frontend
+  * nghttpx: Add --frontend-http2-window-size option, and its family
+  * nghttpx: Use default connection window size with window size optimization
+  * nghttpx: Comment out TCP logging since it is too verbose
+  * nghttpx: Fix compile error with gcc
+  * nghttpx: Fix compile error gcc (again)
+  * nghttpx: Add tls_sni to mruby Nghttpx::Env class
+  * nghttpx: Defer validation of request form after mruby handler
+  * Update man pages
+  * src: Rename OPENSSL_101_API macro as OPENSSL_1_1_API
+  * Mention --enable-lib-only configure option in README
+  * Simplify code
+  * Simplify session_after_frame_sent1
+  * Add nghttp2_option_set_max_deflate_dynamic_table_size() API function
+  * Use the similar naming scheme for table size as 392256e542ad4202360fb94c87c155309473aa6e
+  * nghttpx: Log client address
+  * nghttpx: Add option to specify HPACK encoder/decoder dynamic table size
+  * nghttpx: Handle h2 backend error per Downstream
+  * nghttpx: Migrate backend stream to another h2 session on graceful shutdown
+  * nghttpx: Fix regression introduced in f267e400fa43cec27dc1e400ad661cbc27fc3d10
+  * nghttpx: Remove redundant check using get_downstream_stream_id
+  * nghttpx: Don't check downstream existence since dconn is one-to-one with it
+  * nghttp: Add --encoder-header-table-size option
+  * nghttp: Check maximum value of -c option
+  * nghttpd: Add --encoder-header-table-size option
+  * nghttpd: Check maximum value of -c option
+  * nghttpx: Update doc
+  * Update man pages
+  * Update bash_completion
+  * Fix -Wexpansion-to-defined warning with clang-3.9
+  * Use std::atomic_* overloads for std::shared_ptr if available
+  * nghttpx: Improve performance with h1 backend when request body is involved
+  * integration: Fix test failure with go1.7.1
+  * nghttpx: Handle graceful shutdown with client IP affinity enabled
+  * Fix typo
+  * Document how libnghttp2 schedules HTTP/2 frames internally
+  * Update doc
+  * doc: Sort rst files
+  * doc: Add missing rst files to CMakeLists.txt
+  * Bump up version number to 1.15.0, LT revision to 25:0:11
+  * Update man pages
+  * Add missing rst entry
+  * Bump up version number to 1.16.0-DEV
+  * nghttpx: Don't send RST_STREAM CANCEL to a pushed stream repeatedly
+  * nghttpx: Realloc header buffer
+  * nghttpx: Add BlockAllocator to ClientHandler
+  * nghttpx: Remove unused function declaration
+  * nghttpx: Use StringRef for sni_name_
+  * nghttpx: Use BlockAllocator to encode alt-svc token
+  * nghttpx: Use BlockAllocator for util::quote_string
+  * nghttpx: Add BlockAllocator version of util::formax_hex
+  * nghtpx: Add BlockAllocator version of base64
+  * nghttpx: Increase block size for connection wide BlockAllocator
+  * nghttpx: Add BlockAllocator to SharedDownstreamAddr
+  * nghttpx: Use BlockAllocator per DownstreamConfig
+  * nghttpx: Add BlockAllocator to Config object
+  * nghttpx: Use HeaderRefs for add_request_headers and add_response_headers
+  * nghttpx: Use StringRef for AltSvc fields
+  * nghttpx: Use StringRef for tls.ticket.files
+  * nghttpx: Use StringRef for tls.subcerts
+  * nghttpx: Use StringRef for tls.npn_list
+  * nghttpx: Use StringRef for tls_proto_list
+  * nghttpx: Use StringRef for HttpProxy
+  * nghttpx: Fix bug in util::make_hostport
+  * base64: Assert that input is multiple of 4
+  * nghttpx: Use const ref
+  * nghttpx: Update doc
+  * nghttpx: Use emplace_back instead of push_back
+  * nghttpx: Make it simple to calculate length
+  * nghttpx: Update doc
+  * nghttpx: Use allocator of new config since this may happen multiple times
+  * Fix compile error with gcc
+  * nghttpx: Fix heap-use-after-free when executing new binary
+  * h2load: Add --header-table-size and --encoder-header-table-size options
+  * h2load: Format default value of header table size with unit
+  * nghttpx: Add --ecdh-curves option to specify list of named curves
+  * nghttpx: Don't call get_config() repeatedly
+  * nghttpx: Add P-384 and P-521 to the default of --ecdh-curves option
+  * Update man pages
+  * Update bash_completion
+  * nghttpx: Refactor ocsp command execution
+  * nghttpx: Embed Process into OCSPUpdateContext
+  * nghttpx: Update doc
+  * nghttpx: Apply timeout for incoming header block
+  * nghttpx: Add TLS signed_certificate_timestamp extension support
+  * help2rst.py: Fix * escape
+  * Update man pages
+  * Update bash_completion
+  * Fix build error with OpenSSL < 1.0.2
+  * Fix build error with OpenSSL < 1.0.2 (again)
+  * Fix typo
+  * nghttpx: Add --backend-connect-timeout option
+  * nghttpx: Use pre-allocated buffer for timestamp string
+  * Update man pages
+  * Update bash_completion
+
+  [ Anders Bakken ]
+  * Make it possible to include nghttp2/CMakeLists.txt in another project using add_subdirectory.
+  * Add set_nghttp2_debug_callback to take advantage of DEBUGF statements in when building DEBUGBUILD.
+
+  [ Tatsuhiro Tsujikawa ]
+  * Fix autotools build
+  * Rename functions and nghttp2_debug.h to move debug macro there
+  * clang-format
+  * Re-format debug text output
+  * Add missing nghttp2_debug.h
+  * Update doc
+  * Update doc
+  * Replace final with fin to make clang-format-3.9 happy
+  * Update .clang-format for clang-format-3.9
+  * clang-format-3.9
+  * Update doc
+  * Apply clang-format-diff only to lib, src, examples and tests
+  * src: Add noexcept to move constructor and assignment operator
+  * Update http-parser to feae95a3a69f111bc1897b9048d9acbc290992f9
+  * src: Add XSI-compliant version strerror_r
+  * doc: Mention --no-location-rewrite in "Rewriting location header field" section
+  * nghttpx: Avoid extra allocation on look up host key
+  * asio: Fix bug when end() is called outside nghttp2 callback
+  * xsi_strerror: Use stddef.h so that we can use size_t
+  * asio: Avoid repeated call of io_service::post
+  * nghttpx: Use thread_local if it is available
+  * nghttpx: Fix compile error with --disable-threads
+  * nghttpx: Rename errbuf for neverbleed as nb_errbuf for clarification
+  * nghttpx: Discard iaddrs early
+  * nghttpx: Fix file descriptor leak in read_tls_sct_from_dir
+  * Bump up version number to 1.16.0, LT revision to 26:0:12
+  * Update man pages
+  * nghttpx: Increase block size of connection wide allocator to 512
+  * Add missing nghttp2_set_debug_vprintf_callback.rst to APIDOCS
+  * Bump up version number to 1.17.0-DEV
+
+  [ dalf ]
+  * Fix compilation with BoringSSL
+
+  [ Минаев Михаил ]
+  * Add debian
+
+  [ isaev ]
+
+ -- Jacob Champion <champion.p@gmail.com>  Fri, 28 Oct 2016 15:52:47 +0300
+
 nghttp2 (1.7.1-1) unstable; urgency=high
 
   * Imported upstream version 1.7.1 (fixes CVE-2016-1544)
